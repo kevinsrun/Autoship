@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top" />
+    <style>
+      body { font-family: Arial, sans-serif; padding: 12px; }
+      textarea, input { width: 100%; box-sizing: border-box; }
+      textarea { height: 120px; }
+      button { width: 100%; padding: 10px; margin-top: 10px; }
+      .small { font-size: 12px; opacity: 0.8; }
+      .status { margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <h3>Add Scholarship (AI)</h3>
+
+    <label>Scholarship URL (optional)</label>
+    <input id="url" placeholder="https://..." />
+
+    <label style="margin-top:10px; display:block;">Paste scholarship text (recommended)</label>
+    <textarea id="pastedText" placeholder="Paste the scholarship description here..."></textarea>
+
+    <label style="margin-top:10px; display:block;">Extra notes (optional)</label>
+    <textarea id="extraNotes" style="height:70px;" placeholder="Anything you want to remember..."></textarea>
+
+    <button onclick="submit()">Extract & Add to Main Menu</button>
+
+    <div class="status small" id="status"></div>
+
+    <script>
+      function setStatus(msg) {
+        document.getElementById("status").textContent = msg;
+      }
+
+      function submit() {
+        setStatus("Working...");
+        const payload = {
+          url: document.getElementById("url").value.trim(),
+          pastedText: document.getElementById("pastedText").value,
+          extraNotes: document.getElementById("extraNotes").value
+        };
+
+        google.script.run
+          .withSuccessHandler((res) => {
+            setStatus("Added! Row: " + res.addedRow);
+          })
+          .withFailureHandler((err) => {
+            setStatus("Error: " + (err && err.message ? err.message : err));
+          })
+          .aiAddScholarship(payload);
+      }
+    </script>
+  </body>
+</html>
