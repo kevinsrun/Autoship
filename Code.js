@@ -1,7 +1,12 @@
+// PUSH TEST: 2026-02-07 11:xx
 // @ts-nocheck
 /*************************************************
  * GLOBAL CONFIG
  *************************************************/
+function testToast_() {
+  SpreadsheetApp.getActive().toast("Autoship is LIVE", "OK", 3);
+}
+
 const MAIN_SHEET = "Main Menu";
 const RESULTS_SHEET = "Results";
 const HEADER_ROW = 1;
@@ -96,10 +101,29 @@ function aiAddScholarship(payload) {
     if (idxReq !== null && extracted.requirements) row[idxReq] = extracted.requirements;
     if (idxDue !== null && extracted.due) row[idxDue] = extracted.due;
 
-    if (idxTriage !== null) row[idxTriage] = "new";
-    if (idxStatus !== null) row[idxStatus] = "new";
-    if (idxStart !== null) row[idxStart] = new Date(); // optional: today
-    if (idxDifficulty !== null && extracted.difficulty) row[idxDifficulty] = extracted.difficulty;
+ // optional: today
+if (idxStart !== null) row[idxStart] = new Date();
+
+// --- DROPDOWNS (deterministic, matches your exact options) ---
+if (idxDifficulty !== null) {
+  row[idxDifficulty] = computeDifficulty_(extracted.difficulty); // defaults to "No idea..."
+}
+
+if (idxStatus !== null) {
+  // Sidebar add = you/AI scanned requirements
+  row[idxStatus] = computeStatus_({
+    currentStatus: row[idxStatus],
+    scanned: true,
+    prepped: false,
+    completed: false,
+    surrendered: false
+  });
+}
+
+if (idxTriage !== null) {
+  const dueDate = (idxDue !== null) ? parseSheetDate_(row[idxDue]) : null;
+  row[idxTriage] = computeTriage_(dueDate, row[idxTriage]); // Immediate/Urgent/Non-Urgent from due date
+}
 
     sh.appendRow(row);
     const addedRow = sh.getLastRow();
@@ -236,6 +260,17 @@ if (idxDocId !== null) {
 
     appendLinkIntoCell_(sheet, absoluteRow, idxAppFile + 1, "Essay Draft (Google Doc)", docInfo.url);
     made++;
+    const idxStatus = optionalIndex_(h, "Status");
+const idxDue = optionalIndex_(h, "Due Date");
+const idxTriage = optionalIndex_(h, "Triage");
+
+if (idxStatus !== null) {
+  sheet.getRange(absoluteRow, idxStatus + 1).setValue("Prepped");
+}
+if (idxDue !== null && idxTriage !== null) {
+  const due = parseSheetDate_(data[r][idxDue]);
+  sheet.getRange(absoluteRow, idxTriage + 1).setValue(computeTriage_(due, data[r][idxTriage]));
+}
   }
 
   ss.toast(
@@ -1059,4 +1094,93 @@ function logHeaders_() {
 }
 function debugHeaders() {
   logHeaders_();
+}
+
+const DIFFICULTY_OPTIONS = ["Easy", "Medium", "Hard", "Fuck it", "No idea..."];
+const TRIAGE_OPTIONS = ["Immediate", "Urgent", "Non-Urgent", "Satisfied", "Cooked."];
+const STATUS_OPTIONS = ["Not started", "Scanned", "Prepped", "In Progress", "Completed", "Surrendered"];
+
+// --- normalize + clamp ---
+function norm_(s) {
+  return (s ?? "").toString().trim().toLowerCase().replace(/\u00A0/g, " ").replace(/\s+/g, " ");
+}
+
+function clampToOptions_(raw, options, fallback) {
+  const r = norm_(raw);
+  if (!r) return fallback;
+
+  // exact match
+  for (const o of options) if (norm_(o) === r) return o;
+
+  // contains match
+  for (const o of options) {
+    const no = norm_(o);
+    if (no.includes(r) || r.includes(no)) return o;
+  }
+  return fallback;
+}
+
+// --- parse Due Date robustly ---
+function parseSheetDate_(v) {
+  if (!v) return null;
+  if (v instanceof Date && !isNaN(v.getTime())) return v;
+
+  // handle strings like "2/7/2026" or "2026-02-07"
+  const s = v.toString().trim();
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return d;
+
+  // try mm/dd/yyyy
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (m) {
+    const mm = Number(m[1]), dd = Number(m[2]), yy = Number(m[3]);
+    const yyyy = yy < 100 ? (2000 + yy) : yy;
+    const d2 = new Date(yyyy, mm - 1, dd);
+    if (!isNaN(d2.getTime())) return d2;
+  }
+  return null;
+}
+
+function daysUntil_(dueDate) {
+  if (!dueDate) return null;
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfDue = new Date(dueDate.getFullYear(), dueDate.getMonth(), dueDate.getDate());
+  const ms = startOfDue.getTime() - startOfToday.getTime();
+  return Math.floor(ms / (24 * 3600 * 1000));
+}
+
+// --- triage rules ---
+function computeTriage_(dueDate, currentTriage) {
+  // Preserve terminal states
+  const ct = clampToOptions_(currentTriage, TRIAGE_OPTIONS, "");
+  if (ct === "Satisfied" || ct === "Cooked.") return ct;
+
+  const d = daysUntil_(dueDate);
+  if (d == null) return "Non-Urgent"; // no due date -> default
+
+  if (d < 0) return "Cooked.";            // past due
+  if (d <= 7) return "Immediate";         // < 1 week
+  if (d <= 28) return "Urgent";           // 2–4 weeks (we include 8–28 days)
+  return "Non-Urgent";                    // > 4 weeks
+}
+
+// --- status rules (based on what actions happened) ---
+function computeStatus_(opts) {
+  // opts: { currentStatus, scanned, prepped, completed, surrendered }
+  const cs = clampToOptions_(opts.currentStatus, STATUS_OPTIONS, "Not started");
+
+  // Preserve terminal
+  if (cs === "Completed" || opts.completed) return "Completed";
+  if (cs === "Surrendered" || opts.surrendered) return "Surrendered";
+
+  // Progression
+  if (opts.prepped) return "Prepped";
+  if (opts.scanned) return "Scanned";
+  return "Not started";
+}
+
+// difficulty: default to No idea... unless user/you explicitly set
+function computeDifficulty_(rawDifficulty) {
+  return clampToOptions_(rawDifficulty, DIFFICULTY_OPTIONS, "No idea...");
 }
