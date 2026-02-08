@@ -1,15 +1,17 @@
-// PUSH TEST: 2026-02-07 11:xx
+// PUSH TEST: 2026-02-07 11:xxclasp status
+
 // @ts-nocheck
 /*************************************************
  * GLOBAL CONFIG
  *************************************************/
-function testToast_() {
-  SpreadsheetApp.getActive().toast("Autoship is LIVE", "OK", 3);
-}
-
+ // ===== GLOBAL CONSTANTS (LOAD FIRST) =====
 const MAIN_SHEET = "Main Menu";
 const RESULTS_SHEET = "Results";
 const HEADER_ROW = 1;
+
+function testToast_() {
+  SpreadsheetApp.getActive().toast("Autoship is LIVE", "OK", 3);
+}
 
 const GEMINI_MODEL = "gemini-2.5-flash"; // model string you chose
 
@@ -36,6 +38,7 @@ function onOpen() {
 
   ui.createMenu("Scholarship Tools")
     .addItem("Sync Satisfied → Results", "syncSatisfiedToResults")
+    .addItem("Sync Surrendered → Surrendered", "syncSurrenderedToSheet")
     .addSeparator()
     .addItem("Create Essay Doc(s) for Selected Rows (FAST)", "createEssayDocsForSelection")
     .addItem("Fill Essay Prompt(s) with AI for Selected Rows (SLOW)", "fillEssayPromptsForSelection")
@@ -89,41 +92,67 @@ function aiAddScholarship(payload) {
     const idxStatus = optionalIndex_(h, "Status");
     const idxStart = optionalIndex_(h, "Start date");
     const idxDifficulty = optionalIndex_(h, "Difficulty");
+    const idxTheme = optionalIndex_(h, COL_THEME);
 
-    // Fast, non-hanging extraction
-    const extracted = basicExtractFromText_(pastedText, url);
+    /// Fast, non-hanging extraction
+const extracted = basicExtractFromText_(pastedText, url);
 
-    const row = new Array(lastCol).fill("");
-    row[idxName] = extracted.name || "Scholarship";
-    row[idxPortal] = url || "";
+// ✅ Create row FIRST
+const row = new Array(lastCol).fill("");
+row[idxName] = extracted.name || "Scholarship";
+row[idxPortal] = url || "";
 
-    if (idxNotes !== null) row[idxNotes] = [extracted.notes, extraNotes].filter(Boolean).join("\n").trim();
-    if (idxReq !== null && extracted.requirements) row[idxReq] = extracted.requirements;
-    if (idxDue !== null && extracted.due) row[idxDue] = extracted.due;
-
- // optional: today
-if (idxStart !== null) row[idxStart] = new Date();
-
-// --- DROPDOWNS (deterministic, matches your exact options) ---
-if (idxDifficulty !== null) {
-  row[idxDifficulty] = computeDifficulty_(extracted.difficulty); // defaults to "No idea..."
+// Detect + fill Theme + Requirements (now row exists)
+if (idxTheme !== null) {
+  row[idxTheme] = joinMultiSelect_(detectThemesFromText_(pastedText + "\n" + extraNotes));
 }
 
-if (idxStatus !== null) {
-  // Sidebar add = you/AI scanned requirements
-  row[idxStatus] = computeStatus_({
-    currentStatus: row[idxStatus],
-    scanned: true,
-    prepped: false,
-    completed: false,
-    surrendered: false
-  });
+if (idxReq !== null) {
+  // Merge anything extractor already set + our detector
+  const detectedReq = detectRequirementsFromText_(pastedText + "\n" + extraNotes);
+  const existingReq = (row[idxReq] || "").toString();
+
+  const merged = uniq_(
+    existingReq
+      ? existingReq.split(/[,;\n]+/).map(s => s.trim()).filter(Boolean).concat(detectedReq)
+      : detectedReq
+  );
+  row[idxReq] = joinMultiSelect_(merged);
 }
 
-if (idxTriage !== null) {
-  const dueDate = (idxDue !== null) ? parseSheetDate_(row[idxDue]) : null;
-  row[idxTriage] = computeTriage_(dueDate, row[idxTriage]); // Immediate/Urgent/Non-Urgent from due date
+// Rest of your assignments
+if (idxNotes !== null) row[idxNotes] = [extracted.notes, extraNotes].filter(Boolean).join("\n").trim();
+if (idxReq !== null && extracted.requirements) {
+  const current = (row[idxReq] || "").toString();
+  row[idxReq] = current ? joinMultiSelect_(uniq_(current.split(/[,;\n]+/).map(s=>s.trim()).filter(Boolean)
+    .concat(extracted.requirements.split(/[,;\n]+/).map(s=>s.trim()).filter(Boolean)))) : extracted.requirements;
 }
+
+if (idxDue !== null && extracted.due) row[idxDue] = extracted.due;
+
+    // optional: today
+    if (idxStart !== null) row[idxStart] = new Date();
+
+    // --- DROPDOWNS (deterministic, matches your exact options) ---
+    if (idxDifficulty !== null) {
+      row[idxDifficulty] = computeDifficulty_(extracted.difficulty); // defaults to "No Idea..."
+    }
+
+    if (idxStatus !== null) {
+      // Sidebar add = you/AI scanned requirements
+      row[idxStatus] = computeStatus_({
+        currentStatus: row[idxStatus],
+        scanned: true,
+        prepped: false,
+        completed: false,
+        surrendered: false
+      });
+    }
+
+    if (idxTriage !== null) {
+      const dueDate = (idxDue !== null) ? parseSheetDate_(row[idxDue]) : null;
+      row[idxTriage] = computeTriage_(dueDate, row[idxTriage]); // Immediate/Urgent/Non-Urgent from due date
+    }
 
     sh.appendRow(row);
     const addedRow = sh.getLastRow();
@@ -202,29 +231,40 @@ function basicExtractFromText_(text, url) {
  *************************************************/
 function createEssayDocsForSelection() {
   const ss = SpreadsheetApp.getActive();
-  const sheet = ss.getActiveSheet();
+  const sheet = ss.getSheetByName(MAIN_SHEET);
+  if (!sheet) throw new Error(`Missing sheet: ${MAIN_SHEET}`);
+
   const range = sheet.getActiveRange();
   if (!range) throw new Error("Select at least one cell in the row(s) you want.");
 
   const headers = sheet.getRange(HEADER_ROW, 1, 1, sheet.getLastColumn()).getValues()[0];
   const h = buildHeaderIndex(headers);
 
-  const idxReq = optionalIndex_(h, COL_REQUIREMENTS);
+  const idxReq    = optionalIndex_(h, COL_REQUIREMENTS);
   const idxPortal = optionalIndex_(h, COL_APPLICATION_PORTAL);
-  const idxAppFile = optionalIndex_(h, COL_APPLICATION_FILE);
-  const idxName = optionalIndex_(h, "Scholarship Name");
+  const idxAppFile= optionalIndex_(h, COL_APPLICATION_FILE);
+  const idxName   = optionalIndex_(h, "Scholarship Name");
+
+  // Optional columns
+  const idxDocId  = optionalIndex_(h, "Essay Doc ID");
+  const idxStatus = optionalIndex_(h, "Status");
+  const idxDue    = optionalIndex_(h, "Due Date");
+  const idxTriage = optionalIndex_(h, "Triage");
 
   if (idxReq === null || idxAppFile === null || idxName === null) {
-    throw new Error(`Missing required columns on active sheet: "Scholarship Name", "${COL_REQUIREMENTS}", "${COL_APPLICATION_FILE}"`);
+    throw new Error(
+      `Missing required columns on "${MAIN_SHEET}": "Scholarship Name", "${COL_REQUIREMENTS}", "${COL_APPLICATION_FILE}"`
+    );
   }
 
   const startRow = range.getRow();
   const endRow = range.getLastRow();
   const lastCol = sheet.getLastColumn();
 
-  const data = sheet.getRange(startRow, 1, endRow - startRow + 1, lastCol).getValues();
-  const rich = sheet.getRange(startRow, 1, endRow - startRow + 1, lastCol).getRichTextValues();
-  const formulas = sheet.getRange(startRow, 1, endRow - startRow + 1, lastCol).getFormulas();
+  const numRows = endRow - startRow + 1;
+  const data = sheet.getRange(startRow, 1, numRows, lastCol).getValues();
+  const rich = sheet.getRange(startRow, 1, numRows, lastCol).getRichTextValues();
+  const formulas = sheet.getRange(startRow, 1, numRows, lastCol).getFormulas();
 
   let made = 0;
 
@@ -236,8 +276,13 @@ function createEssayDocsForSelection() {
     if (!requirementsIncludes_(reqText, ESSAY_REQUIREMENT_TOKEN)) continue;
 
     const name = (data[r][idxName] ?? "").toString().trim() || "Scholarship";
+
     const portalUrl = (idxPortal !== null)
-      ? extractBestUrlFromCell_(formulas[r][idxPortal], rich[r][idxPortal], (data[r][idxPortal] ?? "").toString())
+      ? extractBestUrlFromCell_(
+          formulas[r][idxPortal],
+          rich[r][idxPortal],
+          (data[r][idxPortal] ?? "").toString()
+        )
       : "";
 
     const appFileCell = sheet.getRange(absoluteRow, idxAppFile + 1);
@@ -252,25 +297,27 @@ function createEssayDocsForSelection() {
       promptText: "",
       wordLimit: ""
     });
-    // after createEssayPrepDocOneDraft_(...)
-const idxDocId = optionalIndex_(h, "Essay Doc ID");
-if (idxDocId !== null) {
-  sheet.getRange(absoluteRow, idxDocId + 1).setValue(docInfo.id);
-}
 
+    // Store doc id if column exists
+    if (idxDocId !== null && docInfo && docInfo.id) {
+      sheet.getRange(absoluteRow, idxDocId + 1).setValue(docInfo.id);
+    }
+
+    // Put link into Application File
     appendLinkIntoCell_(sheet, absoluteRow, idxAppFile + 1, "Essay Draft (Google Doc)", docInfo.url);
-    made++;
-    const idxStatus = optionalIndex_(h, "Status");
-const idxDue = optionalIndex_(h, "Due Date");
-const idxTriage = optionalIndex_(h, "Triage");
 
-if (idxStatus !== null) {
-  sheet.getRange(absoluteRow, idxStatus + 1).setValue("Prepped");
-}
-if (idxDue !== null && idxTriage !== null) {
-  const due = parseSheetDate_(data[r][idxDue]);
-  sheet.getRange(absoluteRow, idxTriage + 1).setValue(computeTriage_(due, data[r][idxTriage]));
-}
+    // Mark status as Prepped if Status column exists
+    if (idxStatus !== null) {
+      sheet.getRange(absoluteRow, idxStatus + 1).setValue("Prepped");
+    }
+
+    // Update triage if both columns exist
+    if (idxDue !== null && idxTriage !== null) {
+      const due = parseSheetDate_(data[r][idxDue]);
+      sheet.getRange(absoluteRow, idxTriage + 1).setValue(computeTriage_(due, data[r][idxTriage]));
+    }
+
+    made++;
   }
 
   ss.toast(
@@ -288,7 +335,8 @@ if (idxDue !== null && idxTriage !== null) {
  *************************************************/
 function fillEssayPromptsForSelection() {
   const ss = SpreadsheetApp.getActive();
-  const sheet = ss.getActiveSheet();
+  const sheet = ss.getSheetByName(MAIN_SHEET);
+
   const range = sheet.getActiveRange();
   if (!range) throw new Error("Select at least one cell in the row(s) you want.");
 
@@ -363,7 +411,8 @@ function fillEssayPromptsForSelection() {
  *************************************************/
 function deleteEssayDocsForSelection() {
   const ss = SpreadsheetApp.getActive();
-  const sheet = ss.getActiveSheet();
+  const sheet = ss.getSheetByName(MAIN_SHEET);
+
   const range = sheet.getActiveRange();
   if (!range) throw new Error("Select at least one row.");
 
@@ -495,57 +544,197 @@ function syncSatisfiedToResults() {
   const rowsToRemove = [];
   let moved = 0;
 
-  for (let i = 1; i < mainValues.length; i++) {
-    const row = mainValues[i];
-    const name = (row[idxName] || "").toString().trim();
-    if (!name) continue;
+ for (let i = 1; i < mainValues.length; i++) {
+  const row = mainValues[i];
+  const name = (row[idxName] || "").toString().trim();
+  if (!name) continue;
 
-    const triageNorm = normalize_((row[idxTriage] ?? "").toString());
-    if (triageNorm !== "satisfied") continue;
+  // ✅ Results sync is based on TRIAGE == Satisfied
+  const triageNorm = normalize_((row[idxTriage] ?? "").toString());
+  if (triageNorm !== "satisfied") continue;
 
-    const key = name.toLowerCase();
-    if (existing.has(key)) continue;
+  const key = name.toLowerCase();
+  if (existing.has(key)) continue;
 
-    const out = new Array(results.getLastColumn()).fill("");
-    out[rName] = row[idxName];
-    out[rDue] = row[idxDue];
-    out[rDifficulty] = row[idxDifficulty];
-    out[rNotes] = row[idxNotes];
-    out[rPortal] = row[idxPortal];
+  const out = new Array(resValues[0].length).fill("");
 
-    if (rReq !== null && idxReq !== null) out[rReq] = row[idxReq];
-    if (rAppFile !== null && idxAppFile !== null) out[rAppFile] = row[idxAppFile];
-    if (rAddl !== null && idxAddl !== null) out[rAddl] = row[idxAddl];
+  out[rName] = row[idxName];
+  out[rDue] = row[idxDue];
+  out[rDifficulty] = row[idxDifficulty];
+  out[rNotes] = row[idxNotes];
+  out[rPortal] = row[idxPortal];
 
-    results.appendRow(out);
-    const appendedRow = results.getLastRow();
+  if (rReq !== null && idxReq !== null) out[rReq] = row[idxReq];
 
-    enqueuePreservedLinkWrite_({ linkWrites, srcValues: row, srcRichRow: mainRich[i], srcFormulaRow: mainFormulas[i], srcIdx: idxPortal, dstRow: appendedRow, dstCol1Based: rPortal + 1 });
-    if (idxAppFile !== null && rAppFile !== null) enqueuePreservedLinkWrite_({ linkWrites, srcValues: row, srcRichRow: mainRich[i], srcFormulaRow: mainFormulas[i], srcIdx: idxAppFile, dstRow: appendedRow, dstCol1Based: rAppFile + 1 });
-    if (idxAddl !== null && rAddl !== null) enqueuePreservedLinkWrite_({ linkWrites, srcValues: row, srcRichRow: mainRich[i], srcFormulaRow: mainFormulas[i], srcIdx: idxAddl, dstRow: appendedRow, dstCol1Based: rAddl + 1 });
-
-    existing.add(key);
-    moved++;
-    rowsToRemove.push(HEADER_ROW + i);
+  // --- Application File chips ---
+  if (rAppFile !== null && idxAppFile !== null) {
+    out[rAppFile] = chipFormulaFromCell_(
+      row[idxAppFile],
+      mainRich[i][idxAppFile],
+      mainFormulas[i][idxAppFile]
+    );
   }
 
-  linkWrites.forEach(w => {
-    const cell = results.getRange(w.row, w.col);
-    if (w.formula) cell.setFormula(w.formula);
-    else if (w.richText) cell.setRichTextValue(w.richText);
+  if (rAddl !== null && idxAddl !== null) {
+    out[rAddl] = chipFormulaFromCell_(
+      row[idxAddl],
+      mainRich[i][idxAddl],
+      mainFormulas[i][idxAddl]
+    );
+  }
+
+  results.appendRow(out);
+  const appendedRow = results.getLastRow();
+
+  // Preserve rich links in portal/files (if present)
+  enqueuePreservedLinkWrite_({
+    linkWrites,
+    srcValues: row,
+    srcRichRow: mainRich[i],
+    srcFormulaRow: mainFormulas[i],
+    srcIdx: idxPortal,
+    dstRow: appendedRow,
+    dstCol1Based: rPortal + 1
   });
 
-  if (rowsToRemove.length) {
-    rowsToRemove.sort((a, b) => b - a);
-    for (const r of rowsToRemove) {
-      try { main.deleteRow(r); }
-      catch (err) { main.getRange(r, 1, 1, lastCol).clearContent(); }
+  if (idxAppFile !== null && rAppFile !== null) {
+    enqueuePreservedLinkWrite_({
+      linkWrites,
+      srcValues: row,
+      srcRichRow: mainRich[i],
+      srcFormulaRow: mainFormulas[i],
+      srcIdx: idxAppFile,
+      dstRow: appendedRow,
+      dstCol1Based: rAppFile + 1
+    });
+  }
+
+  if (idxAddl !== null && rAddl !== null) {
+    enqueuePreservedLinkWrite_({
+      linkWrites,
+      srcValues: row,
+      srcRichRow: mainRich[i],
+      srcFormulaRow: mainFormulas[i],
+      srcIdx: idxAddl,
+      dstRow: appendedRow,
+      dstCol1Based: rAddl + 1
+    });
+  }
+
+  existing.add(key);
+  moved++;
+  rowsToRemove.push(HEADER_ROW + i);
+}
+// <-- Add this closing brace to end syncSatisfiedToResults
+}
+
+function syncSurrenderedToSheet() {
+  const ss = SpreadsheetApp.getActive();
+  const main = ss.getSheetByName(MAIN_SHEET);
+  if (!main) throw new Error("Missing Main sheet.");
+
+  const SURRENDERED_SHEET = "Surrendered";
+  let surrendered = ss.getSheetByName(SURRENDERED_SHEET);
+  if (!surrendered) surrendered = ss.insertSheet(SURRENDERED_SHEET);
+
+  const HEADERS = ["Scholarship Name", "Date of Surrender", "Reason", "Lesson"];
+
+  // Ensure Surrendered header row is exactly the 4 headers
+  const sLastRow = surrendered.getLastRow();
+  if (sLastRow < 1) {
+    surrendered.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
+  } else {
+    const existingHeader = surrendered.getRange(1, 1, 1, HEADERS.length).getValues()[0];
+    const same =
+      existingHeader.length === HEADERS.length &&
+      existingHeader.every((v, i) => String(v) === String(HEADERS[i]));
+    if (!same) {
+      surrendered.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
     }
   }
 
-  ss.toast(moved ? `Moved ${moved} satisfied scholarship(s).` : "No satisfied scholarships found.", "Scholarship Tools", 6);
+  const lastRow = main.getLastRow();
+  const lastCol = main.getLastColumn();
+  if (lastRow <= HEADER_ROW) {
+    ss.toast("No data rows below header.", "Scholarship Tools", 5);
+    return;
+  }
+
+  const numRows = lastRow - HEADER_ROW + 1;
+  const mainRange = main.getRange(HEADER_ROW, 1, numRows, lastCol);
+  const mainValues = mainRange.getValues();
+  const h = buildHeaderIndex(mainValues[0]);
+  const mainDisplay = mainRange.getDisplayValues();
+
+  const idxName = mustIndex(h, "Scholarship Name");
+  const idxStatus = mustIndex(h, "Status");
+
+
+  // If you have dedicated columns in Main for Reason/Lesson, use them.
+  // If not, we’ll pull from Notes as a fallback.
+  const idxNotes = optionalIndex_(h, "Notes");
+  const idxReason = optionalIndex_(h, "Reason");
+  const idxLesson = optionalIndex_(h, "Lesson");
+
+  // Build existing set in Surrendered by scholarship name (avoid duplicates)
+  const sData = surrendered.getDataRange().getValues();
+  const existing = new Set();
+  for (let r = 1; r < sData.length; r++) {
+    const nm = (sData[r][0] || "").toString().trim();
+    if (nm) existing.add(nm.toLowerCase());
+  }
+
+  const rowsToDelete = [];
+  const rowsToAppend = [];
+
+  const todayStr = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd");
+
+  for (let i = 1; i < mainValues.length; i++) {
+  // ✅ Surrendered sync is based on STATUS == Surrendered (use display values)
+  const statusDisp = String(mainDisplay[i][idxStatus] ?? "").trim();
+  const statusNorm = normalize_(statusDisp);
+  if (statusNorm !== "surrendered") continue;
+
+  const name = (mainValues[i][idxName] || "").toString().trim();
+  if (!name) continue;
+
+  // Pull reason/lesson (prefer dedicated cols; fallback to Notes)
+  const reason =
+    (idxReason !== null ? (mainValues[i][idxReason] || "") : "") ||
+    (idxNotes !== null ? (mainValues[i][idxNotes] || "") : "");
+
+  const lesson =
+    (idxLesson !== null ? (mainValues[i][idxLesson] || "") : "");
+
+  if (!existing.has(name.toLowerCase())) {
+    rowsToAppend.push([name, todayStr, String(reason || ""), String(lesson || "")]);
+    existing.add(name.toLowerCase());
+  }
+
+  rowsToDelete.push(HEADER_ROW + i);
 }
 
+  if (!rowsToDelete.length) {
+    ss.toast('No rows marked "Surrendered".', "Scholarship Tools", 5);
+    return;
+  }
+
+  // Append to Surrendered
+  if (rowsToAppend.length) {
+    const startRow = Math.max(surrendered.getLastRow(), 1) + 1;
+    surrendered.getRange(startRow, 1, rowsToAppend.length, HEADERS.length).setValues(rowsToAppend);
+  }
+
+  // Delete from Main bottom-up
+  rowsToDelete.sort((a, b) => b - a);
+  for (const r of rowsToDelete) main.deleteRow(r);
+
+  ss.toast(
+    `Moved ${rowsToAppend.length} new row(s) to Surrendered; removed ${rowsToDelete.length} from Main.`,
+    "Scholarship Tools",
+    6
+  );
+}
 /*************************************************
  * AI extraction (URL/PDF) for prompt
  *************************************************/
@@ -1096,9 +1285,23 @@ function debugHeaders() {
   logHeaders_();
 }
 
-const DIFFICULTY_OPTIONS = ["Easy", "Medium", "Hard", "Fuck it", "No idea..."];
+const DIFFICULTY_OPTIONS = ["Easy", "Medium", "Hard", "Fuck it", "No Idea..."];
 const TRIAGE_OPTIONS = ["Immediate", "Urgent", "Non-Urgent", "Satisfied", "Cooked."];
 const STATUS_OPTIONS = ["Not started", "Scanned", "Prepped", "In Progress", "Completed", "Surrendered"];
+const COL_THEME = "Theme";
+
+// Dropdown options (keep EXACT spelling to match your sheet)
+const THEME_OPTIONS = [
+  "Biomed.", "Comp Sci.", "Business/Entrepreneurship", "Pol. Sci.", "Herritage",
+  "Engineering", "Math/Sci", "First Gen", "Broke", "English/Humanities",
+  "Leadership/Service", "None", "Other"
+];
+
+const REQUIREMENT_OPTIONS = [
+  "Essay(s)", "Rec. Letter(s)", "App./ECs)", "Academics/Transcript",
+  "Field of Study", "Exam(s)", "Interview(s)", "Broke/Finances",
+  "Video/Recording", "Other"
+];
 
 // --- normalize + clamp ---
 function norm_(s) {
@@ -1165,6 +1368,153 @@ function computeTriage_(dueDate, currentTriage) {
   return "Non-Urgent";                    // > 4 weeks
 }
 
+function uniq_(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of (arr || [])) {
+    const k = norm_(x);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(x);
+  }
+  return out;
+}
+
+function joinMultiSelect_(items) {
+  return uniq_(items).join(", ");
+}
+
+// ===== Helpers (bottom of file) =====
+
+function fileChip_(driveId) {
+  return `=FILE("${driveId}")`;
+}
+
+function linkChip_(url, label) {
+  return `=HYPERLINK("${url}", "${label}")`;
+}
+
+function driveIdFromUrl_(url) {
+  if (!url) return "";
+  const u = String(url);
+
+  // /d/<id>
+  let m = u.match(/\/d\/([a-zA-Z0-9_-]{20,})/);
+  if (m) return m[1];
+
+  // ?id=<id>
+  m = u.match(/[?&]id=([a-zA-Z0-9_-]{20,})/);
+  if (m) return m[1];
+
+  return "";
+}
+
+function chipFormulaFromCell_(plainValue, richText, formula) {
+  // Prefer a clickable URL from rich text link if present
+  let url = "";
+  try {
+    if (richText && typeof richText.getLinkUrl === "function") {
+      url = richText.getLinkUrl() || "";
+    }
+  } catch (e) {}
+
+  // If no rich link, try formula like HYPERLINK("url","label")
+  if (!url && formula) {
+    const m = String(formula).match(/HYPERLINK\("([^"]+)"/i);
+    if (m) url = m[1];
+  }
+
+  // If still no url, maybe the plain value is a URL
+  if (!url && plainValue && /^https?:\/\//i.test(String(plainValue))) {
+    url = String(plainValue);
+  }
+
+  // Build chip
+  const id = driveIdFromUrl_(url);
+  if (id) return `=FILE("${id}")`;         // ✅ true Drive file chip
+  if (url) return `=HYPERLINK("${url}","Open")`; // fallback link
+  return ""; // nothing
+}
+
+function detectThemesFromText_(text) {
+  const t = norm_(text);
+
+  // Fast keyword buckets
+  const hits = [];
+
+  if (/\b(biomed|medical|medicine|health|hospital|nursing|patient|clinical|physician|biology|biochem|bioengineering|premed)\b/.test(t))
+    hits.push("Biomed.");
+
+  if (/\b(computer science|comp sci|software|programming|coding|developer|cs|machine learning|ai|data science|cyber|security)\b/.test(t))
+    hits.push("Comp Sci.");
+
+  if (/\b(engineering|mechanical|electrical|civil|chemical engineering|a\/e\/c|construction|architecture)\b/.test(t))
+    hits.push("Engineering");
+
+  if (/\b(math|mathematics|calculus|statistics|physics|chemistry|stem)\b/.test(t))
+    hits.push("Math/Sci");
+
+  if (/\b(english|humanities|literature|history|philosophy|writing)\b/.test(t))
+    hits.push("English/Humanities");
+
+  if (/\b(business|entrepreneur|entrepreneurship|startup|marketing|finance|economics)\b/.test(t))
+    hits.push("Business/Entrepreneurship");
+
+  if (/\b(political|politics|government|public policy|policy|civics|international relations|law|legal)\b/.test(t))
+    hits.push("Pol. Sci.");
+
+  if (/\b(first[- ]gen|first generation)\b/.test(t))
+    hits.push("First Gen");
+
+  if (/\b(financial need|need[- ]based|low[- ]income|income|fafsa|pell|scholarship need)\b/.test(t))
+    hits.push("Broke");
+
+  if (/\b(heritage|cultural|ethnic|minority|refugee|immigrant|asian|latino|black|african american|native)\b/.test(t))
+    hits.push("Herritage");
+
+  if (/\b(leadership|service|volunteer|community|nonprofit|mentor|tutor)\b/.test(t))
+    hits.push("Leadership/Service");
+
+  // If nothing matched, set Other (never blank)
+  const finalHits = uniq_(hits);
+  return finalHits.length ? finalHits : ["Other"];
+}
+
+function detectRequirementsFromText_(text) {
+  const t = norm_(text);
+  const req = [];
+
+  if (/\b(essay|personal statement|short answer|writing prompt)\b/.test(t))
+    req.push("Essay(s)");
+
+  if (/\b(letter of recommendation|recommendation letter|rec letter|reference letter)\b/.test(t))
+    req.push("Rec. Letter(s)");
+
+  if (/\b(resume|activities|extracurricular|ec|experience|work experience|volunteer hours|community service)\b/.test(t))
+    req.push("App./ECs"); // match your dropdown text exactly
+
+  if (/\b(transcript|gpa|grades|academic record|class rank)\b/.test(t))
+    req.push("Academics/Transcript");
+
+  if (/\b(major|field of study|must be enrolled in|degree program|pursuing)\b/.test(t))
+    req.push("Field of Study");
+
+  if (/\b(exam|test score|sat|act|ap score)\b/.test(t))
+    req.push("Exam(s)");
+
+  if (/\b(interview)\b/.test(t))
+    req.push("Interview(s)");
+
+  if (/\b(financial|income|tax return|fafsa|need[- ]based|household|budget)\b/.test(t))
+    req.push("Broke/Finances");
+
+  if (/\b(video|recording|youtube|tiktok|reel|submit a video)\b/.test(t))
+    req.push("Video/Recording");
+
+  const finalReq = uniq_(req);
+  return finalReq.length ? finalReq : [];
+}
+
 // --- status rules (based on what actions happened) ---
 function computeStatus_(opts) {
   // opts: { currentStatus, scanned, prepped, completed, surrendered }
@@ -1182,5 +1532,17 @@ function computeStatus_(opts) {
 
 // difficulty: default to No idea... unless user/you explicitly set
 function computeDifficulty_(rawDifficulty) {
-  return clampToOptions_(rawDifficulty, DIFFICULTY_OPTIONS, "No idea...");
+  return clampToOptions_(rawDifficulty, DIFFICULTY_OPTIONS, "No Idea...");
+}
+
+function _pushProof() {
+  SpreadsheetApp.getActive().toast("CLASP IS FIXED", "Autoship", 4);
+}
+
+function findColByNorm_(headerRow, targetNorm) {
+  const t = normalize_(targetNorm);
+  for (let c = 0; c < headerRow.length; c++) {
+    if (normalize_(String(headerRow[c] ?? "")) === t) return c;
+  }
+  return null;
 }
