@@ -40,6 +40,8 @@ function onOpen() {
     .addItem("Sync Satisfied → Results", "syncSatisfiedToResults")
     .addItem("Sync Surrendered → Surrendered", "syncSurrenderedToSheet")
     .addSeparator()
+    .addItem("Refresh Triage (Main Menu)", "refreshTriageForMainMenu")
+    .addSeparator()
     .addItem("Create Essay Doc(s) for Selected Rows (FAST)", "createEssayDocsForSelection")
     .addItem("Fill Essay Prompt(s) with AI for Selected Rows (SLOW)", "fillEssayPromptsForSelection")
     .addSeparator()
@@ -1219,6 +1221,81 @@ function debugTriageValues() {
 }
 
 /*************************************************
+ * TRIAGE: Recompute for all rows in Main Menu
+ * - Uses Due Date + computeTriage_()
+ * - Preserves terminal triage (Satisfied, Cooked)
+ * - If Status == Completed => Triage = Satisfied (optional but recommended)
+ *************************************************/
+function refreshTriageForMainMenu() {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const sh = ss.getSheetByName(MAIN_SHEET);
+    if (!sh) throw new Error(`Sheet not found: ${MAIN_SHEET}`);
+
+    const lastRow = sh.getLastRow();
+    const lastCol = sh.getLastColumn();
+    if (lastRow <= HEADER_ROW) {
+      ss.toast("No data rows below header.", "Scholarship Tools", 5);
+      return;
+    }
+
+    const range = sh.getRange(HEADER_ROW, 1, lastRow - HEADER_ROW + 1, lastCol);
+    const values = range.getValues();
+    const display = range.getDisplayValues(); // helps with dropdown-rendered text
+    const headers = values[0];
+    const h = buildHeaderIndex(headers);
+
+    const idxDue = optionalIndex_(h, "Due Date");
+    const idxTriage = optionalIndex_(h, "Triage");
+    const idxStatus = optionalIndex_(h, "Status");
+
+    if (idxTriage === null) throw new Error('Missing column header: "Triage"');
+    if (idxDue === null) throw new Error('Missing column header: "Due Date"');
+
+    const triageUpdates = [];
+    let changed = 0;
+
+    for (let r = 1; r < values.length; r++) {
+      const status = (idxStatus !== null ? String(display[r][idxStatus] ?? "") : "").trim();
+      const statusNorm = normalize_(status);
+
+      // If completed, triage should be satisfied (recommended behavior)
+      if (statusNorm === "completed") {
+        const current = String(values[r][idxTriage] ?? "").trim();
+        if (normalize_(current) !== "satisfied") changed++;
+        triageUpdates.push(["Satisfied"]);
+        continue;
+      }
+
+      // Preserve terminal triage values
+      const currentTriageRaw = String(values[r][idxTriage] ?? "").trim();
+      const currentTriageNorm = normalize_(currentTriageRaw);
+
+      if (currentTriageNorm === "satisfied" || currentTriageNorm === "cooked" || currentTriageNorm === "cooked") {
+        triageUpdates.push([currentTriageRaw]); // keep exactly as-is
+        continue;
+      }
+
+      const due = parseSheetDate_(values[r][idxDue]);
+      const nextTriage = computeTriage_(due, currentTriageRaw);
+
+      if (normalize_(nextTriage) !== currentTriageNorm) changed++;
+      triageUpdates.push([nextTriage]);
+    }
+
+    // Write back in one shot
+    sh.getRange(HEADER_ROW + 1, idxTriage + 1, triageUpdates.length, 1).setValues(triageUpdates);
+
+    ss.toast(`Triage refreshed. Updated ${changed} row(s).`, "Scholarship Tools", 6);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/*************************************************
  * Shared helpers
  *************************************************/
 function buildHeaderIndex(headerRow) {
@@ -1286,7 +1363,7 @@ function debugHeaders() {
 }
 
 const DIFFICULTY_OPTIONS = ["Easy", "Medium", "Hard", "Fuck it", "No Idea..."];
-const TRIAGE_OPTIONS = ["Immediate", "Urgent", "Non-Urgent", "Satisfied", "Cooked."];
+const TRIAGE_OPTIONS = ["Immediate", "Urgent", "Non-Urgent", "Satisfied", "Cooked"];
 const STATUS_OPTIONS = ["Not started", "Scanned", "Prepped", "In Progress", "Completed", "Surrendered"];
 const COL_THEME = "Theme";
 
@@ -1357,12 +1434,12 @@ function daysUntil_(dueDate) {
 function computeTriage_(dueDate, currentTriage) {
   // Preserve terminal states
   const ct = clampToOptions_(currentTriage, TRIAGE_OPTIONS, "");
-  if (ct === "Satisfied" || ct === "Cooked.") return ct;
+  if (ct === "Satisfied" || ct === "Cooked") return ct;
 
   const d = daysUntil_(dueDate);
   if (d == null) return "Non-Urgent"; // no due date -> default
 
-  if (d < 0) return "Cooked.";            // past due
+  if (d < 0) return "Cooked";            // past due
   if (d <= 7) return "Immediate";         // < 1 week
   if (d <= 28) return "Urgent";           // 2–4 weeks (we include 8–28 days)
   return "Non-Urgent";                    // > 4 weeks
@@ -1533,6 +1610,15 @@ function computeStatus_(opts) {
 // difficulty: default to No idea... unless user/you explicitly set
 function computeDifficulty_(rawDifficulty) {
   return clampToOptions_(rawDifficulty, DIFFICULTY_OPTIONS, "No Idea...");
+}
+
+function installDailyTriageRefreshTrigger() {
+  // runs around 6am in your spreadsheet’s timezone
+  ScriptApp.newTrigger("refreshTriageForMainMenu")
+    .timeBased()
+    .everyDays(1)
+    .atHour(6)
+    .create();
 }
 
 function _pushProof() {
