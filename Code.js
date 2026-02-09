@@ -30,6 +30,12 @@ const PDF_REQUIRED_KEYWORDS = ["pdf", "upload a pdf", "submit a pdf", "pdf forma
 // Performance tuning
 const MAX_HTML_CHARS = 12000; // reduce for speed
 
+// Reminder schedule (days before due date)
+const SCHOLARSHIP_REMINDER_DAYS = [7, 3, 1]; // change if you want 14,10,5,3,1 etc.
+
+// Status words that should REMOVE the event
+const REMOVE_EVENT_TRIAGE_VALUES = ["surrendered"];
+const REMOVE_EVENT_STATUS_VALUES = ["submitted", "complete", "completed", "won", "not applying"];
 /*************************************************
  * MENU
  *************************************************/
@@ -39,11 +45,14 @@ function onOpen() {
   ui.createMenu("Scholarship Tools")
     .addItem("Sync Satisfied → Results", "syncSatisfiedToResults")
     .addItem("Sync Surrendered → Surrendered", "syncSurrenderedToSheet")
+    .addItem("Sync Deadlines → Google Calendar", "syncScholarshipDeadlinesToCalendar")
     .addSeparator()
     .addItem("Refresh Triage (Main Menu)", "refreshTriageForMainMenu")
     .addSeparator()
     .addItem("Create Essay Doc(s) for Selected Rows (FAST)", "createEssayDocsForSelection")
     .addItem("Fill Essay Prompt(s) with AI for Selected Rows (SLOW)", "fillEssayPromptsForSelection")
+    .addSeparator()
+    .addItem("Pipe Canvas Intake → Main Menu", "pipeCanvasHitsToMainMenu")
     .addSeparator()
     .addItem("Delete Essay Docs for Selected Rows", "deleteEssayDocsForSelection")
     .addItem("Debug: Count Triage Values", "debugTriageValues")
@@ -174,29 +183,630 @@ if (idxDue !== null && extracted.due) row[idxDue] = extracted.due;
   }
 }
 
-function basicExtractFromText_(text, url) {
+function detectEssayPrompt_(text) {
   const t = (text || "").replace(/\u00A0/g, " ").trim();
-  const firstLine = (t.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0] || "").slice(0, 80);
+  if (t.length < 80) return "";
 
-  const dueMatch = t.match(/\b(due|deadline)\b[:\s-]*([^\n]{0,60})/i);
-  const req = /essay|personal statement|short answer/i.test(t) ? "Essay(s)" : "";
+  // Strong signals
+  const hasEssaySignal = /essay|personal statement|short answer|prompt|respond|write about|topic|question:/i.test(t);
+  if (!hasEssaySignal) return "";
+
+  // Try to pull a “prompt-like” chunk:
+  // 1) If there is a "Prompt:" section
+  const m1 = t.match(/(?:^|\n)\s*(prompt|essay prompt|writing prompt)\s*[:\-]\s*([\s\S]{40,1200})/i);
+  if (m1 && m1[2]) return m1[2].trim();
+
+  // 2) If there is a question mark cluster, take surrounding text
+  const qIdx = t.search(/\?/);
+  if (qIdx !== -1) {
+    const start = Math.max(0, qIdx - 250);
+    const end = Math.min(t.length, qIdx + 900);
+    return t.slice(start, end).trim();
+  }
+
+  // 3) Fallback: first 900 chars if essay signal exists
+  return t.slice(0, 900).trim();
+}
+
+function createEssayDoc_(scholarshipName, sourceUrl, promptText) {
+  const safeName = (scholarshipName || "Scholarship").toString().trim();
+  const docTitle = `${safeName} (Essay Prompt)`;
+
+  const doc = DocumentApp.create(docTitle);
+  const body = doc.getBody();
+  body.clear();
+
+  // Title
+  const pTitle = body.appendParagraph(docTitle);
+  pTitle.setHeading(DocumentApp.ParagraphHeading.TITLE);
+  pTitle.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 30,
+    [DocumentApp.Attribute.BOLD]: true
+  });
+
+  // Heading 1: Source
+  const pH1 = body.appendParagraph("Source");
+  pH1.setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  pH1.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 24,
+    [DocumentApp.Attribute.BOLD]: true
+  });
+
+  // Normal text: URL
+  const pUrl = body.appendParagraph(sourceUrl || "");
+  pUrl.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 12
+  });
+
+  // Heading 1: Prompt
+  const pH2 = body.appendParagraph("Prompt");
+  pH2.setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  pH2.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 24,
+    [DocumentApp.Attribute.BOLD]: true
+  });
+
+  // Normal text: prompt
+  const pPrompt = body.appendParagraph((promptText || "").trim());
+  pPrompt.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 12
+  });
+
+  // Heading 1: Notes
+  const pH3 = body.appendParagraph("Notes");
+  pH3.setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  pH3.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 24,
+    [DocumentApp.Attribute.BOLD]: true
+  });
+
+  // Normal placeholder
+  const pNotes = body.appendParagraph("");
+  pNotes.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 12
+  });
+
+  doc.saveAndClose();
+  return doc.getUrl();
+}
+/*******************************
+ * CANVAS → AUTOSHIP INTAKE
+ * Focus:
+ *  - HEAVY: MHS Counselor (announcements + modules)
+ *  - LIGHT: Class of 2026 (announcements + modules, fewer items)
+ *******************************/
+
+const CANVAS_INTAKE_SHEET = "Canvas Intake";
+
+// Course matching (flexible): edit if your actual course names differ
+const COURSE_MATCH = {
+  // Exact match for your counselor course name
+  COUNSELOR_EXACT: [/^MHS Counselors$/i],
+
+  // Keep Class of 2026 broad unless you tell me the exact name
+  CLASS_2026: [/class/i, /2026/i]
+};
+
+// Scholarship-ish keywords (expand whenever)
+const SCHOLAR_KEYWORDS = [
+  "scholarship", "award", "grant", "fellowship",
+  "financial", "money", "tuition", "apply", "application",
+  "deadline", "due", "senior", "class of", "$", "dollars",
+  "local scholarship", "foundation", "community scholarship",
+  "FAFSA", "TASFA"
+];
+
+// How “hard” to scan each course
+const SCAN_PROFILE = {
+  COUNSELOR: {
+    announcementsLookbackDays: 120,
+    modulesLookbackDays: 365,
+    maxModuleItems: 250   // high
+  },
+  CLASS_2026: {
+    announcementsLookbackDays: 45,
+    modulesLookbackDays: 120,
+    maxModuleItems: 60    // light
+  }
+};
+
+/***************
+ * ENTRY POINT
+ ***************/
+function scanCanvasForScholarships() {
+  const courses = canvasListActiveCourses_();
+
+  const counselorCourses = pickCourses_(courses, COURSE_MATCH.COUNSELOR_EXACT);
+  const class2026Courses = pickCourses_(courses, COURSE_MATCH.CLASS_2026);
+
+
+  const targets = [];
+  counselorCourses.forEach(c => targets.push({ course: c, profile: "COUNSELOR" }));
+  class2026Courses.forEach(c => targets.push({ course: c, profile: "CLASS_2026" }));
+
+  if (!targets.length) {
+    throw new Error("No matching Canvas courses found. Rename match patterns in COURSE_MATCH.");
+  }
+
+  ensureCanvasIntakeSheet_();
+
+  // Load dedupe set from existing sheet
+  const seen = loadSeenKeys_();
+
+  // Process heavy first
+  targets.sort((a, b) => (a.profile === "COUNSELOR" ? -1 : 1));
+
+  const rowsToAppend = [];
+
+  targets.forEach(t => {
+    const { course, profile } = t;
+    const cfg = SCAN_PROFILE[profile];
+
+    // Announcements (always)
+    const ann = canvasFetchAnnouncements_(course.id, cfg.announcementsLookbackDays);
+    ann.forEach(a => {
+      const hit = scholarshipHit_(a.title, a.message);
+      if (!hit) return;
+
+      const key = `announcement:${a.id}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      rowsToAppend.push(canvasRow_({
+        key,
+        profile,
+        course,
+        type: "Announcement",
+        title: a.title,
+        body: stripHtml_(a.message),
+        postedAt: a.posted_at,
+        url: a.html_url || "",
+        hit
+      }));
+    });
+
+    // Modules + items
+    const modItems = canvasFetchModuleItems_(course.id, cfg.modulesLookbackDays, cfg.maxModuleItems);
+    modItems.forEach(mi => {
+      // Cheap first pass: title-only filter to save quota
+      const hitTitleOnly = scholarshipHit_(mi.title, "");
+      if (!hitTitleOnly) return;
+
+      // Deep fetch content from Canvas API (page/assignment/discussion/file)
+      const deep = canvasDeepFetchTextForModuleItem_(course.id, mi);
+
+      // Real test on fetched body
+      const hit = scholarshipHit_(deep.title, deep.body);
+      if (!hit) return;
+
+      const key = `module_item:${mi.id}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      rowsToAppend.push(canvasRow_({
+        key,
+        profile,
+        course,
+        type: `Module Item (${mi.type || "unknown"})`,
+        title: deep.title,
+        body: deep.body,
+        postedAt: mi.updated_at || mi.published_at || "",
+        url: deep.url,
+        hit
+      }));
+    });
+  }); // <-- Add this closing brace to end targets.forEach
+}
+
+/***********************
+ * CANVAS API HELPERS
+ ***********************/
+function canvasBaseUrl_() {
+  const v = PropertiesService.getScriptProperties().getProperty("CANVAS_BASE_URL");
+  if (!v) throw new Error("Missing Script Property: CANVAS_BASE_URL");
+  return v.replace(/\/+$/, "");
+}
+function canvasToken_() {
+  const v = PropertiesService.getScriptProperties().getProperty("CANVAS_TOKEN");
+  if (!v) throw new Error("Missing Script Property: CANVAS_TOKEN");
+  return v.trim();
+}
+
+function canvasFetchJson_(path, params) {
+  const base = canvasBaseUrl_();
+  const url = buildUrl_(base + path, params || {});
+  const res = UrlFetchApp.fetch(url, {
+    method: "get",
+    muteHttpExceptions: true,
+    headers: { Authorization: "Bearer " + canvasToken_() }
+  });
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) {
+    throw new Error(`Canvas API error ${code}: ${res.getContentText().slice(0, 200)}`);
+  }
+  return JSON.parse(res.getContentText() || "null");
+}
+
+function canvasListActiveCourses_() {
+  // enrollment_state=active keeps it clean; per_page helps reduce pagination needs
+  const data = canvasFetchJson_("/api/v1/courses", {
+    enrollment_state: "active",
+    per_page: 100
+  });
+  // data can include many; keep minimal fields
+  return (data || []).map(c => ({
+    id: c.id,
+    name: c.name || c.course_code || `Course ${c.id}`
+  }));
+}
+
+function canvasFetchAnnouncements_(courseId, lookbackDays) {
+  const start = new Date(Date.now() - lookbackDays * 24 * 3600 * 1000).toISOString();
+  const data = canvasFetchJson_("/api/v1/announcements", {
+    "context_codes[]": `course_${courseId}`,
+    start_date: start,
+    per_page: 100
+  });
+  return (data || []).map(a => ({
+    id: a.id,
+    title: a.title || "(no title)",
+    message: a.message || "",
+    posted_at: a.posted_at || "",
+    html_url: a.html_url || ""
+  }));
+}
+
+function canvasFetchModuleItems_(courseId, lookbackDays, maxItems) {
+  const cutoff = Date.now() - lookbackDays * 24 * 3600 * 1000;
+
+  const modules = canvasFetchJson_(`/api/v1/courses/${courseId}/modules`, { per_page: 100 }) || [];
+
+  const out = [];
+  for (let i = 0; i < modules.length; i++) {
+    if (out.length >= maxItems) break;
+
+    const m = modules[i];
+    const items = canvasFetchJson_(`/api/v1/courses/${courseId}/modules/${m.id}/items`, { per_page: 100 }) || [];
+
+    for (let j = 0; j < items.length; j++) {
+      if (out.length >= maxItems) break;
+
+      const it = items[j];
+      const updated = parseDate_(it.updated_at) || parseDate_(it.published_at);
+      if (updated && updated.getTime() < cutoff) continue;
+
+      out.push({
+        id: it.id,
+        title: it.title || "(no title)",
+        type: it.type || "",               // <- key for deep fetch
+        content_id: it.content_id || null, // <- key for deep fetch
+        page_url: it.page_url || "",       // <- some items include this
+        url: it.url || "",
+        html_url: it.html_url || "",
+        updated_at: it.updated_at || "",
+        published_at: it.published_at || ""
+      });
+    }
+  }
+  return out;
+}
+
+/***********************
+ * FILTERING + OUTPUT
+ ***********************/
+function scholarshipHit_(title, body) {
+  const t = (title || "").toLowerCase();
+  const b = (body || "").toLowerCase();
+
+  // strong signals
+  for (const k of SCHOLAR_KEYWORDS) {
+    if (k === "$") {
+      if (t.includes("$") || b.includes("$")) return "contains:$";
+      continue;
+    }
+    if (t.includes(k) || b.includes(k)) return `contains:${k}`;
+  }
+
+  // quick extra pattern: “due DATE”
+  if (/\bdue\b/.test(t + " " + b) && /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/.test(t + " " + b)) {
+    return "pattern:due+month";
+  }
+
+  return "";
+}
+
+function canvasRow_({ key, profile, course, type, title, body, postedAt, url, hit }) {
+  return [
+    new Date(),            // Imported At
+    key,                   // Unique Key (dedupe)
+    profile,               // COUNSELOR / CLASS_2026
+    course.name,           // Course
+    type,                  // Announcement / Module Item
+    title || "",
+    postedAt || "",
+    url || "",
+    hit || "",
+    body || ""             // Snippet/body
+  ];
+}
+
+function ensureCanvasIntakeSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(CANVAS_INTAKE_SHEET);
+  if (!sh) sh = ss.insertSheet(CANVAS_INTAKE_SHEET);
+
+  if (sh.getLastRow() === 0) {
+    sh.appendRow([
+      "Imported At",
+      "Unique Key",
+      "Profile",
+      "Course",
+      "Type",
+      "Title",
+      "Posted/Updated At",
+      "URL",
+      "Hit",
+      "Snippet/Body"
+    ]);
+    sh.setFrozenRows(1);
+  }
+}
+
+function appendCanvasRows_(rows) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(CANVAS_INTAKE_SHEET);
+  const startRow = sh.getLastRow() + 1;
+  sh.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function loadSeenKeys_() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(CANVAS_INTAKE_SHEET);
+  const seen = new Set();
+  if (!sh || sh.getLastRow() < 2) return seen;
+
+  // Unique Key is column 2
+  const values = sh.getRange(2, 2, sh.getLastRow() - 1, 1).getValues();
+  values.forEach(r => {
+    const k = (r[0] || "").toString().trim();
+    if (k) seen.add(k);
+  });
+  return seen;
+}
+
+/***********************
+ * UTIL
+ ***********************/
+function pickCourses_(courses, regexList) {
+  return (courses || []).filter(c => {
+    const name = (c.name || "").toString();
+    return regexList.every(rx => rx.test(name));
+  });
+}
+
+function buildUrl_(base, params) {
+  const q = Object.keys(params).map(k => {
+    const v = params[k];
+    return encodeURIComponent(k) + "=" + encodeURIComponent(v);
+  }).join("&");
+  return q ? `${base}?${q}` : base;
+}
+
+function stripHtml_(html) {
+  if (!html) return "";
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseDate_(s) {
+  if (!s) return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function basicExtractFromText_(text, url) {
+  const t = (text || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const firstLine =
+    (t.split(/\r?\n/)
+      .map(s => s.trim())
+      .filter(Boolean)[0] || "").slice(0, 80);
+
+  const dueMatch = t.match(
+    /\b(due|deadline)\b[:\s-]*([^\n]{0,60})/i
+  );
+
+  const requirements =
+    /essay|personal statement|short answer/i.test(t)
+      ? "Essay(s)"
+      : "";
 
   return {
     name: firstLine || "Scholarship",
+    portal: url || "",
     due: dueMatch ? dueMatch[2].trim() : "",
-    requirements: req,
+    requirements,
     difficulty: "",
     notes: ""
   };
 }
 
-// same simple extractor as before
-function basicExtractFromText_(text, url) {
-  const t = (text || "").replace(/\u00A0/g, " ").trim();
-  const firstLine = (t.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0] || "").slice(0, 80);
-  const dueMatch = t.match(/\b(due|deadline)\b[:\s-]*([^\n]{0,50})/i);
-  const req = /essay/i.test(t) ? "Essay(s)" : "";
-  return { name: firstLine || "Scholarship", portal: url || "", due: dueMatch ? dueMatch[2].trim() : "", requirements: req, difficulty: "", notes: "" };
+function pipeCanvasHitsToMainMenu() {
+  const ss = SpreadsheetApp.getActive();
+
+  const intake = ss.getSheetByName("Canvas Intake");
+  if (!intake) throw new Error('Missing sheet: "Canvas Intake"');
+
+  const main = ss.getSheetByName(MAIN_SHEET); // "Main Menu" from your config
+  if (!main) throw new Error(`Missing sheet: "${MAIN_SHEET}"`);
+
+  // --- Read headers ---
+  const intakeLastCol = intake.getLastColumn();
+  const intakeHeaders = intake.getRange(1, 1, 1, intakeLastCol).getValues()[0];
+  const ih = buildHeaderIndex(intakeHeaders);
+
+  const idxImportedAt = optionalIndex_(ih, "Imported At");
+  const idxKey = mustIndex(ih, "Unique Key");
+  const idxProfile = optionalIndex_(ih, "Profile");
+  const idxCourse = optionalIndex_(ih, "Course");
+  const idxType = optionalIndex_(ih, "Type");
+  const idxTitle = mustIndex(ih, "Title");
+  const idxPosted = optionalIndex_(ih, "Posted/Updated At");
+  const idxUrl = mustIndex(ih, "URL");
+  const idxBody = optionalIndex_(ih, "Snippet/Body");
+
+  // Ensure "Piped" column exists on intake
+  let idxPiped = optionalIndex_(ih, "Piped");
+  if (idxPiped === null) {
+    intake.getRange(1, intakeLastCol + 1).setValue("Piped");
+    idxPiped = intakeLastCol; // 0-based index for new column
+  }
+
+  const intakeLastRow = intake.getLastRow();
+  if (intakeLastRow < 2) return;
+
+  const intakeValues = intake.getRange(2, 1, intakeLastRow - 1, intake.getLastColumn()).getValues();
+
+  // --- Main Menu header map ---
+  const mainLastCol = main.getLastColumn();
+  const mainHeaders = main.getRange(HEADER_ROW, 1, 1, mainLastCol).getValues()[0];
+  const mh = buildHeaderIndex(mainHeaders);
+
+  const mName = mustIndex(mh, "Scholarship Name");
+  const mPortal = mustIndex(mh, "Application Portal");
+  const mDue = optionalIndex_(mh, "Due Date");
+  const mReq = optionalIndex_(mh, "Requirements");
+  const mNotes = optionalIndex_(mh, "Notes");
+  const mTriage = optionalIndex_(mh, "Triage");
+  const mDifficulty = optionalIndex_(mh, "Difficulty");
+
+  // Build a quick dedupe set from Main Menu notes + portal
+  const existing = new Set();
+  const mainLastRow = main.getLastRow();
+  if (mainLastRow >= 2) {
+    const portalCol = mPortal + 1;
+    const notesCol = mNotes !== null ? (mNotes + 1) : null;
+
+    const portals = main.getRange(2, portalCol, mainLastRow - 1, 1).getValues();
+    portals.forEach(r => {
+      const u = (r[0] || "").toString().trim();
+      if (u) existing.add("portal:" + u);
+    });
+
+    if (notesCol) {
+      const notes = main.getRange(2, notesCol, mainLastRow - 1, 1).getValues();
+      notes.forEach(r => {
+        const n = (r[0] || "").toString();
+        const m = n.match(/\[CanvasKey:([^\]]+)\]/i);
+        if (m && m[1]) existing.add("key:" + m[1].trim());
+      });
+    }
+  }
+
+  const rowsToAppend = [];
+  const pipedUpdates = []; // [rowIndexWithinIntakeValues, "YES"]
+
+  for (let r = 0; r < intakeValues.length; r++) {
+    const row = intakeValues[r];
+
+    const alreadyPiped = String(row[idxPiped] || "").trim();
+    if (alreadyPiped) continue;
+
+    const key = String(row[idxKey] || "").trim();
+    const title = String(row[idxTitle] || "").trim();
+    const url = String(row[idxUrl] || "").trim();
+    const body = idxBody !== null ? String(row[idxBody] || "") : "";
+
+    if (!title || !url || !key) continue;
+
+    // hard dedupe: key + portal
+    if (existing.has("key:" + key) || existing.has("portal:" + url)) {
+      pipedUpdates.push([r, "DUPLICATE"]);
+      continue;
+    }
+
+    const extracted = basicExtractFromText_(body, url);
+    // --- Essay prompt detection + doc creation ---
+  let essayDocUrl = "";
+  const promptText = detectEssayPrompt_(body);
+
+  if (promptText && promptText.length >= 80) {
+    essayDocUrl = createEssayDoc_(
+      extracted.name || title || "Scholarship",
+      url,
+      promptText
+    );
+  }
+
+    const newRow = new Array(mainLastCol).fill("");
+    newRow[mName] = extracted.name || title || "Scholarship";
+    newRow[mPortal] = url;
+    newRow[mNotes] = essayDocUrl ? `[Essay Doc: ${essayDocUrl}]` : "";
+
+    if (mDue !== null) newRow[mDue] = extracted.due || "";
+    if (mReq !== null) newRow[mReq] = extracted.requirements || "";
+    if (mDifficulty !== null) newRow[mDifficulty] = extracted.difficulty || "";
+    if (mTriage !== null) newRow[mTriage] = ""; // let refreshTriageForMainMenu compute it
+
+    if (mNotes !== null) {
+      const course = idxCourse !== null ? String(row[idxCourse] || "").trim() : "";
+      const type = idxType !== null ? String(row[idxType] || "").trim() : "";
+      const posted = idxPosted !== null ? String(row[idxPosted] || "").trim() : "";
+      const profile = idxProfile !== null ? String(row[idxProfile] || "").trim() : "";
+      const importedAt = idxImportedAt !== null ? row[idxImportedAt] : "";
+
+      const meta = [
+        `[CanvasKey:${key}]`,
+        profile ? `Profile=${profile}` : "",
+        course ? `Course=${course}` : "",
+        type ? `Type=${type}` : "",
+        posted ? `Posted=${posted}` : "",
+        importedAt ? `Imported=${importedAt}` : ""
+      ].filter(Boolean).join(" | ");
+
+      const snippet = body ? `\n\nCanvas Snippet: ${body}` : "";
+      newRow[mNotes] = meta + snippet;
+    }
+
+    rowsToAppend.push(newRow);
+    pipedUpdates.push([r, "YES"]);
+
+    existing.add("key:" + key);
+    existing.add("portal:" + url);
+  }
+
+  if (rowsToAppend.length) {
+    main.getRange(main.getLastRow() + 1, 1, rowsToAppend.length, rowsToAppend[0].length).setValues(rowsToAppend);
+  }
+
+  if (pipedUpdates.length) {
+    // Write back "Piped" status
+    const pipedCol = idxPiped + 1; // 1-based for Range
+    const updatesRange = intake.getRange(2, pipedCol, intakeValues.length, 1);
+    const colVals = updatesRange.getValues();
+
+    pipedUpdates.forEach(([i, val]) => colVals[i][0] = val);
+    updatesRange.setValues(colVals);
+  }
+
+  // Optional: refresh triage after adding
+  // refreshTriageForMainMenu();
+
+  ss.toast(`Piped ${rowsToAppend.length} Canvas hit(s) into Main Menu.`, "Autoship", 6);
 }
 
 /**
@@ -1295,6 +1905,208 @@ function refreshTriageForMainMenu() {
   }
 }
 
+/***********************
+ * MAIN MENU → GOOGLE CALENDAR
+ ***********************/
+
+const CAL_EVENT_COL_NAME = "Calendar Event Id";
+
+function syncScholarshipDeadlinesToCalendar() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(MAIN_SHEET);
+  if (!sh) throw new Error(`Missing sheet: ${MAIN_SHEET}`);
+
+  const calId = PropertiesService.getScriptProperties()
+    .getProperty("SCHOLARSHIP_CALENDAR_ID") || "primary";
+  const cal = CalendarApp.getCalendarById(calId);
+  if (!cal) throw new Error(`Could not open calendar: ${calId}`);
+
+  const lastCol = sh.getLastColumn();
+  const headers = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
+  const h = buildHeaderIndex(headers);
+
+  const idxName = mustIndex(h, "Scholarship Name");
+  const idxPortal = mustIndex(h, "Application Portal");
+  const idxDue = mustIndex(h, "Due Date");
+
+  // Optional
+  const idxTriage = optionalIndex_(h, "Triage");
+  const idxStatus = optionalIndex_(h, "Status");
+  const idxNotes = optionalIndex_(h, "Notes");
+
+  let idxEvent = optionalIndex_(h, CAL_EVENT_COL_NAME);
+  if (idxEvent === null) {
+    sh.getRange(HEADER_ROW, lastCol + 1).setValue(CAL_EVENT_COL_NAME);
+    idxEvent = lastCol; // 0-based
+  }
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < HEADER_ROW + 1) return;
+
+  const dataRange = sh.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, sh.getLastColumn());
+  const data = dataRange.getValues();
+
+  let created = 0, updated = 0, removed = 0, skipped = 0;
+
+  for (let r = 0; r < data.length; r++) {
+    const row = data[r];
+
+    const name = String(row[idxName] || "").trim();
+    const portal = String(row[idxPortal] || "").trim();
+    const dueRaw = row[idxDue];
+    let eventId = String(row[idxEvent] || "").trim();
+
+    // Decide status-aware removal
+    const triage = idxTriage !== null ? String(row[idxTriage] || "").trim().toLowerCase() : "";
+    const status = idxStatus !== null ? String(row[idxStatus] || "").trim().toLowerCase() : "";
+
+    const shouldRemove =
+      (triage && REMOVE_EVENT_TRIAGE_VALUES.includes(triage)) ||
+      (status && REMOVE_EVENT_STATUS_VALUES.includes(status));
+
+    // If marked submitted/surrendered: delete calendar event and clear id
+    if (shouldRemove) {
+      if (eventId) {
+        const ev = safeGetEventById_(cal, eventId);
+        if (ev) {
+          ev.deleteEvent();
+          removed++;
+        }
+        row[idxEvent] = ""; // clear stored id either way
+        eventId = "";
+      } else {
+        skipped++;
+      }
+      continue;
+    }
+
+    // Need minimum fields to create/update
+    if (!name || !portal || !dueRaw) {
+      skipped++;
+      continue;
+    }
+
+    const dueDate = parseDueDate_(dueRaw);
+    if (!dueDate) {
+      skipped++;
+      continue;
+    }
+
+    const allDay = new Date(dueDate.getFullYear(), dueDate.getMonth(), dueDate.getDate());
+    const eventTitle = `Scholarship Due: ${name}`;
+
+    const notes = idxNotes !== null ? String(row[idxNotes] || "") : "";
+    const eventDesc =
+      `Scholarship: ${name}\n` +
+      `Portal: ${portal}\n` +
+      `Sheet: ${MAIN_SHEET}\n` +
+      (notes ? `\nNotes:\n${notes}\n` : "");
+
+    if (!eventId) {
+      const ev = cal.createAllDayEvent(eventTitle, allDay, {
+        description: eventDesc,
+        location: portal
+      });
+      applyScholarshipReminders_(ev);
+      row[idxEvent] = ev.getId();
+      created++;
+      continue;
+    }
+
+    // Update existing
+    let ev = safeGetEventById_(cal, eventId);
+    if (!ev) {
+      const newEv = cal.createAllDayEvent(eventTitle, allDay, {
+        description: eventDesc,
+        location: portal
+      });
+      applyScholarshipReminders_(newEv);
+      row[idxEvent] = newEv.getId();
+      created++;
+      continue;
+    }
+
+    // Check date changes for all-day events
+    const evDate = ev.getAllDayStartDate ? ev.getAllDayStartDate() : ev.getStartTime();
+    const evDay = new Date(evDate.getFullYear(), evDate.getMonth(), evDate.getDate());
+
+    const needsDate = evDay.getTime() !== allDay.getTime();
+    const needsTitle = ev.getTitle() !== eventTitle;
+    const needsLoc = (ev.getLocation() || "") !== portal;
+    const needsDesc = (ev.getDescription() || "") !== eventDesc;
+
+    if (needsDate) {
+      // safest for all-day: recreate
+      ev.deleteEvent();
+      const repl = cal.createAllDayEvent(eventTitle, allDay, {
+        description: eventDesc,
+        location: portal
+      });
+      applyScholarshipReminders_(repl);
+      row[idxEvent] = repl.getId();
+      updated++;
+      continue;
+    }
+
+    if (needsTitle) ev.setTitle(eventTitle);
+    if (needsLoc) ev.setLocation(portal);
+    if (needsDesc) ev.setDescription(eventDesc);
+
+    // Ensure reminders are present (idempotent-ish)
+    ensureScholarshipReminders_(ev);
+
+    if (needsTitle || needsLoc || needsDesc) updated++;
+    else skipped++;
+  }
+
+  dataRange.setValues(data);
+  ss.toast(`Calendar: created ${created}, updated ${updated}, removed ${removed}, skipped ${skipped}`, "Autoship", 7);
+}
+
+/***********************
+ * Due date parser
+ * Accepts: Date objects or strings like "Mar 1, 2026", "3/1/26", "2026-03-01"
+ ***********************/
+function parseDueDate_(dueRaw) {
+  if (Object.prototype.toString.call(dueRaw) === "[object Date]" && !isNaN(dueRaw.getTime())) {
+    return dueRaw;
+  }
+
+  const s = String(dueRaw || "").trim();
+  if (!s) return null;
+
+  // ISO-ish
+  const iso = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+  if (iso) {
+    const y = +iso[1], m = +iso[2] - 1, d = +iso[3];
+    const dt = new Date(y, m, d);
+    return isNaN(dt.getTime()) ? null : dt;
+  }
+
+  // MM/DD/YY or MM/DD/YYYY
+  const md = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (md) {
+    const m = +md[1] - 1, d = +md[2];
+    let y = +md[3];
+    if (y < 100) y += 2000;
+    const dt = new Date(y, m, d);
+    return isNaN(dt.getTime()) ? null : dt;
+  }
+
+  // Let Date.parse try (handles "March 1, 2026" etc.)
+  const p = Date.parse(s);
+  if (!isNaN(p)) return new Date(p);
+
+  // If text contains a date-like substring, try to extract
+  const sub = s.match(/(\w+\s+\d{1,2},\s+\d{4})/);
+  if (sub) {
+    const p2 = Date.parse(sub[1]);
+    if (!isNaN(p2)) return new Date(p2);
+  }
+
+  return null;
+}
+
 /*************************************************
  * Shared helpers
  *************************************************/
@@ -1612,6 +2424,77 @@ function computeDifficulty_(rawDifficulty) {
   return clampToOptions_(rawDifficulty, DIFFICULTY_OPTIONS, "No Idea...");
 }
 
+function canvasDeepFetchTextForModuleItem_(courseId, mi) {
+  // Returns: { title, body, url }  (body is plain text)
+  const type = (mi.type || "").toLowerCase();
+  const cid = mi.content_id;
+
+  // default fallback: what we already have
+  const fallback = {
+    title: mi.title || "",
+    body: "",
+    url: mi.html_url || mi.url || ""
+  };
+
+  try {
+    // Page
+    if (type === "page") {
+      // Canvas sometimes provides page_url; if not, we can’t resolve reliably
+      const pageUrl = mi.page_url;
+      if (!pageUrl) return fallback;
+
+      const page = canvasFetchJson_(`/api/v1/courses/${courseId}/pages/${encodeURIComponent(pageUrl)}`, {});
+      return {
+        title: page.title || fallback.title,
+        body: stripHtml_(page.body || ""),
+        url: page.html_url || fallback.url
+      };
+    }
+
+    // Assignment
+    if (type === "assignment" && cid) {
+      const a = canvasFetchJson_(`/api/v1/courses/${courseId}/assignments/${cid}`, {});
+      return {
+        title: a.name || fallback.title,
+        body: stripHtml_(a.description || ""),
+        url: a.html_url || fallback.url
+      };
+    }
+
+    // Discussion topic
+    if ((type === "discussion" || type === "discussion_topic") && cid) {
+      const d = canvasFetchJson_(`/api/v1/courses/${courseId}/discussion_topics/${cid}`, {});
+      return {
+        title: d.title || fallback.title,
+        body: stripHtml_(d.message || ""),
+        url: d.html_url || fallback.url
+      };
+    }
+
+    // File (metadata only; you can store download link)
+    if (type === "file" && cid) {
+      const f = canvasFetchJson_(`/api/v1/files/${cid}`, {});
+      const bestUrl = f.url || f.html_url || fallback.url; // f.url is often a direct download URL
+      return {
+        title: f.display_name || fallback.title,
+        body: `File posted: ${f.display_name || ""}`.trim(),
+        url: bestUrl
+      };
+    }
+
+    // External URL
+    if (type === "external_url") {
+      return fallback;
+    }
+
+    return fallback;
+  } catch (e) {
+    // Don’t kill the whole run if one item errors
+    Logger.log(`deepFetch fail course=${courseId} item=${mi.id} type=${mi.type}: ${e && e.message ? e.message : e}`);
+    return fallback;
+  }
+}
+
 function installDailyTriageRefreshTrigger() {
   // runs around 6am in your spreadsheet’s timezone
   ScriptApp.newTrigger("refreshTriageForMainMenu")
@@ -1631,4 +2514,39 @@ function findColByNorm_(headerRow, targetNorm) {
     if (normalize_(String(headerRow[c] ?? "")) === t) return c;
   }
   return null;
+}
+
+function safeGetEventById_(cal, eventId) {
+  try {
+    return cal.getEventById(eventId);
+  } catch (e) {
+    return null;
+  }
+}
+
+function applyScholarshipReminders_(ev) {
+  // Clear existing reminders then add ours
+  try {
+    ev.removeAllReminders();
+  } catch (e) {
+    // Some events may not support removal in edge cases; ignore
+  }
+
+  // Add popup reminders at midnight-local offsets
+  // (Days -> minutes)
+  SCHOLARSHIP_REMINDER_DAYS.forEach(d => {
+    const minutes = d * 24 * 60;
+    try {
+      ev.addPopupReminder(minutes);
+    } catch (e) {
+      // If popup reminder fails, you can switch to email reminders:
+      // ev.addEmailReminder(minutes);
+    }
+  });
+}
+
+function ensureScholarshipReminders_(ev) {
+  // Simple strategy: always reset to the correct schedule.
+  // Keeps it consistent even if user edits reminders manually.
+  applyScholarshipReminders_(ev);
 }
