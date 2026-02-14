@@ -1,4 +1,4 @@
-// PUSH TEST: 2026-02-07 11:xxclasp status
+// PUSH TEST: 2026-02-14 11:xxclasp status
 
 // @ts-nocheck
 /*************************************************
@@ -7,6 +7,7 @@
  // ===== GLOBAL CONSTANTS (LOAD FIRST) =====
 const MAIN_SHEET = "Main Menu";
 const RESULTS_SHEET = "Results";
+const SURRENDERED_SHEET = "Surrendered";
 const HEADER_ROW = 1;
 
 function testToast_() {
@@ -36,6 +37,46 @@ const SCHOLARSHIP_REMINDER_DAYS = [7, 3, 1]; // change if you want 14,10,5,3,1 e
 // Status words that should REMOVE the event
 const REMOVE_EVENT_TRIAGE_VALUES = ["surrendered"];
 const REMOVE_EVENT_STATUS_VALUES = ["submitted", "complete", "completed", "won", "not applying"];
+
+function discoverCanvasApiBase() {
+  const token = (PropertiesService.getScriptProperties().getProperty("CANVAS_TOKEN") || "").trim();
+  const start = "https://canvas.arlingtonisd.org/api/v1/courses?per_page=1";
+
+  const res = UrlFetchApp.fetch(start, {
+    method: "get",
+    muteHttpExceptions: true,
+    followRedirects: false, // IMPORTANT: so we can see Location
+    headers: { Authorization: "Bearer " + token }
+  });
+
+  Logger.log("HTTP " + res.getResponseCode());
+  const headers = res.getAllHeaders();
+  Logger.log("Location: " + (headers.Location || headers.location || "(none)"));
+  Logger.log("Body preview: " + (res.getContentText() || "").slice(0, 120));
+}
+
+function debugCanvasCoursesCall() {
+  const base = PropertiesService.getScriptProperties().getProperty("CANVAS_BASE_URL");
+  const token = PropertiesService.getScriptProperties().getProperty("CANVAS_TOKEN");
+
+  const url = (base || "").replace(/\/+$/, "") + "/api/v1/courses?per_page=1";
+  Logger.log("Canvas URL = " + url);
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "get",
+    muteHttpExceptions: true,
+    headers: { Authorization: "Bearer " + (token || "").trim() }
+  });
+
+  Logger.log("HTTP " + res.getResponseCode());
+  Logger.log(res.getContentText().slice(0, 200));
+}
+
+function debugCanvasBaseUrlProp() {
+  const props = PropertiesService.getScriptProperties().getProperties();
+  Logger.log("CANVAS_BASE_URL = " + (props.CANVAS_BASE_URL || "(missing)"));
+  Logger.log("All props keys = " + Object.keys(props).sort().join(", "));
+}
 /*************************************************
  * MENU
  *************************************************/
@@ -326,7 +367,6 @@ function scanCanvasForScholarships() {
   const counselorCourses = pickCourses_(courses, COURSE_MATCH.COUNSELOR_EXACT);
   const class2026Courses = pickCourses_(courses, COURSE_MATCH.CLASS_2026);
 
-
   const targets = [];
   counselorCourses.forEach(c => targets.push({ course: c, profile: "COUNSELOR" }));
   class2026Courses.forEach(c => targets.push({ course: c, profile: "CLASS_2026" }));
@@ -337,10 +377,7 @@ function scanCanvasForScholarships() {
 
   ensureCanvasIntakeSheet_();
 
-  // Load dedupe set from existing sheet
   const seen = loadSeenKeys_();
-
-  // Process heavy first
   targets.sort((a, b) => (a.profile === "COUNSELOR" ? -1 : 1));
 
   const rowsToAppend = [];
@@ -372,38 +409,43 @@ function scanCanvasForScholarships() {
       }));
     });
 
-    // Modules + items
-    const modItems = canvasFetchModuleItems_(course.id, cfg.modulesLookbackDays, cfg.maxModuleItems);
-    modItems.forEach(mi => {
-      // Cheap first pass: title-only filter to save quota
-      const hitTitleOnly = scholarshipHit_(mi.title, "");
-      if (!hitTitleOnly) return;
+    // Modules (weekly)
+    const doModules = (new Date().getDay() === 0); // Sunday only
+    if (doModules) {
+      const modItems = canvasFetchModuleItems_(course.id, cfg.modulesLookbackDays, cfg.maxModuleItems);
 
-      // Deep fetch content from Canvas API (page/assignment/discussion/file)
-      const deep = canvasDeepFetchTextForModuleItem_(course.id, mi);
+      modItems.forEach(mi => {
+        // Cheap first pass: title-only filter
+        const hitTitleOnly = scholarshipHit_(mi.title, "");
+        if (!hitTitleOnly) return;
 
-      // Real test on fetched body
-      const hit = scholarshipHit_(deep.title, deep.body);
-      if (!hit) return;
+        const deep = canvasDeepFetchTextForModuleItem_(course.id, mi);
+        const hit = scholarshipHit_(deep.title, deep.body);
+        if (!hit) return;
 
-      const key = `module_item:${mi.id}`;
-      if (seen.has(key)) return;
-      seen.add(key);
+        const key = `module_item:${mi.id}`;
+        if (seen.has(key)) return;
+        seen.add(key);
 
-      rowsToAppend.push(canvasRow_({
-        key,
-        profile,
-        course,
-        type: `Module Item (${mi.type || "unknown"})`,
-        title: deep.title,
-        body: deep.body,
-        postedAt: mi.updated_at || mi.published_at || "",
-        url: deep.url,
-        hit
-      }));
-    });
-  }); // <-- Add this closing brace to end targets.forEach
-}
+        rowsToAppend.push(canvasRow_({
+          key,
+          profile,
+          course,
+          type: `Module Item (${mi.type || "unknown"})`,
+          title: deep.title,
+          body: deep.body,
+          postedAt: mi.updated_at || mi.published_at || "",
+          url: deep.url,
+          hit
+        }));
+      });
+    }
+  }); // end targets.forEach
+
+  if (rowsToAppend.length) {
+    appendCanvasRows_(rowsToAppend);
+  }
+} // end scanCanvasForScholarships
 
 /***********************
  * CANVAS API HELPERS
@@ -411,8 +453,16 @@ function scanCanvasForScholarships() {
 function canvasBaseUrl_() {
   const v = PropertiesService.getScriptProperties().getProperty("CANVAS_BASE_URL");
   if (!v) throw new Error("Missing Script Property: CANVAS_BASE_URL");
-  return v.replace(/\/+$/, "");
+
+  const base = v.replace(/\/+$/, "");
+  if (/canvas\.arlingtonisd\.org$/i.test(base)) {
+    throw new Error(
+      "Wrong CANVAS_BASE_URL. Use https://arlington.instructure.com (canvas.arlingtonisd.org returns 404 for API)."
+    );
+  }
+  return base;
 }
+
 function canvasToken_() {
   const v = PropertiesService.getScriptProperties().getProperty("CANVAS_TOKEN");
   if (!v) throw new Error("Missing Script Property: CANVAS_TOKEN");
@@ -422,11 +472,14 @@ function canvasToken_() {
 function canvasFetchJson_(path, params) {
   const base = canvasBaseUrl_();
   const url = buildUrl_(base + path, params || {});
+  Logger.log("Canvas URL: " + url);   // <-- add this line
+
   const res = UrlFetchApp.fetch(url, {
     method: "get",
     muteHttpExceptions: true,
     headers: { Authorization: "Bearer " + canvasToken_() }
   });
+
   const code = res.getResponseCode();
   if (code < 200 || code >= 300) {
     throw new Error(`Canvas API error ${code}: ${res.getContentText().slice(0, 200)}`);
@@ -435,12 +488,12 @@ function canvasFetchJson_(path, params) {
 }
 
 function canvasListActiveCourses_() {
-  // enrollment_state=active keeps it clean; per_page helps reduce pagination needs
   const data = canvasFetchJson_("/api/v1/courses", {
-    enrollment_state: "active",
-    per_page: 100
+    per_page: 100,
+    "include[]": "term",
+    "fields[]": "id,name,course_code,workflow_state,access_restricted_by_date"
   });
-  // data can include many; keep minimal fields
+
   return (data || []).map(c => ({
     id: c.id,
     name: c.name || c.course_code || `Course ${c.id}`
@@ -466,14 +519,25 @@ function canvasFetchAnnouncements_(courseId, lookbackDays) {
 function canvasFetchModuleItems_(courseId, lookbackDays, maxItems) {
   const cutoff = Date.now() - lookbackDays * 24 * 3600 * 1000;
 
-  const modules = canvasFetchJson_(`/api/v1/courses/${courseId}/modules`, { per_page: 100 }) || [];
+  const ITEMS_PER_PAGE = 30;        // lower payload per call
+  const MAX_MODULES_PER_RUN = 4;    // prevent bandwidth bursts
+
+  const modules = canvasFetchJson_(`/api/v1/courses/${courseId}/modules`, {
+    per_page: ITEMS_PER_PAGE
+  }) || [];
 
   const out = [];
-  for (let i = 0; i < modules.length; i++) {
+
+  for (let i = 0; i < modules.length && i < MAX_MODULES_PER_RUN; i++) {
     if (out.length >= maxItems) break;
 
     const m = modules[i];
-    const items = canvasFetchJson_(`/api/v1/courses/${courseId}/modules/${m.id}/items`, { per_page: 100 }) || [];
+
+    const items = canvasFetchJson_(`/api/v1/courses/${courseId}/modules/${m.id}/items`, {
+      per_page: ITEMS_PER_PAGE
+    }) || [];
+
+    Utilities.sleep(250); // reduce burst
 
     for (let j = 0; j < items.length; j++) {
       if (out.length >= maxItems) break;
@@ -485,9 +549,9 @@ function canvasFetchModuleItems_(courseId, lookbackDays, maxItems) {
       out.push({
         id: it.id,
         title: it.title || "(no title)",
-        type: it.type || "",               // <- key for deep fetch
-        content_id: it.content_id || null, // <- key for deep fetch
-        page_url: it.page_url || "",       // <- some items include this
+        type: it.type || "",
+        content_id: it.content_id || null,
+        page_url: it.page_url || "",
         url: it.url || "",
         html_url: it.html_url || "",
         updated_at: it.updated_at || "",
@@ -495,6 +559,7 @@ function canvasFetchModuleItems_(courseId, lookbackDays, maxItems) {
       });
     }
   }
+
   return out;
 }
 
@@ -522,18 +587,19 @@ function scholarshipHit_(title, body) {
   return "";
 }
 
-function canvasRow_({ key, profile, course, type, title, body, postedAt, url, hit }) {
+function canvasRow_({ key, fingerprint, profile, course, type, title, body, postedAt, url, hit }) {
   return [
-    new Date(),            // Imported At
-    key,                   // Unique Key (dedupe)
-    profile,               // COUNSELOR / CLASS_2026
-    course.name,           // Course
-    type,                  // Announcement / Module Item
+    new Date(),
+    key,
+    fingerprint || "",
+    profile,
+    course.name,
+    type,
     title || "",
     postedAt || "",
     url || "",
     hit || "",
-    body || ""             // Snippet/body
+    body || ""
   ];
 }
 
@@ -543,18 +609,20 @@ function ensureCanvasIntakeSheet_() {
   if (!sh) sh = ss.insertSheet(CANVAS_INTAKE_SHEET);
 
   if (sh.getLastRow() === 0) {
-    sh.appendRow([
-      "Imported At",
-      "Unique Key",
-      "Profile",
-      "Course",
-      "Type",
-      "Title",
-      "Posted/Updated At",
-      "URL",
-      "Hit",
-      "Snippet/Body"
-    ]);
+      sh.appendRow([
+    "Imported At",
+    "Unique Key",
+    "Fingerprint",
+    "Profile",
+    "Course",
+    "Type",
+    "Title",
+    "Posted/Updated At",
+    "URL",
+    "Hit",
+    "Snippet/Body"
+  ]);
+
     sh.setFrozenRows(1);
   }
 }
@@ -572,11 +640,15 @@ function loadSeenKeys_() {
   const seen = new Set();
   if (!sh || sh.getLastRow() < 2) return seen;
 
-  // Unique Key is column 2
-  const values = sh.getRange(2, 2, sh.getLastRow() - 1, 1).getValues();
-  values.forEach(r => {
-    const k = (r[0] || "").toString().trim();
-    if (k) seen.add(k);
+  const lastRow = sh.getLastRow();
+
+  // Unique Key is col 2, Fingerprint is col 3
+  const keys = sh.getRange(2, 2, lastRow - 1, 2).getValues(); // cols 2-3
+  keys.forEach(r => {
+    const k = String(r[0] || "").trim();
+    const f = String(r[1] || "").trim();
+    if (k) seen.add("key:" + k);
+    if (f) seen.add("fp:" + f);
   });
   return seen;
 }
@@ -695,7 +767,7 @@ function pipeCanvasHitsToMainMenu() {
   const mDifficulty = optionalIndex_(mh, "Difficulty");
 
   // Build a quick dedupe set from Main Menu notes + portal
-  const existing = new Set();
+  const existing = buildExistingScholarshipKeySet_();
   const mainLastRow = main.getLastRow();
   if (mainLastRow >= 2) {
     const portalCol = mPortal + 1;
@@ -790,7 +862,37 @@ function pipeCanvasHitsToMainMenu() {
   }
 
   if (rowsToAppend.length) {
-    main.getRange(main.getLastRow() + 1, 1, rowsToAppend.length, rowsToAppend[0].length).setValues(rowsToAppend);
+  const startRow = main.getLastRow() + 1;
+
+  // 1) fast append
+  main.getRange(startRow, 1, rowsToAppend.length, rowsToAppend[0].length)
+    .setValues(rowsToAppend);
+
+  // 2) rebuild RichText for link-sensitive columns (Notes + Portal)
+  for (let i = 0; i < rowsToAppend.length; i++) {
+    const r = startRow + i;
+
+    // Portal: make clickable if it’s a URL
+    if (mPortal !== null) {
+      const portal = String(rowsToAppend[i][mPortal] || "").trim();
+      if (portal && /^https?:\/\//i.test(portal)) {
+        const rt = SpreadsheetApp.newRichTextValue()
+          .setText(portal)
+          .setLinkUrl(portal)
+          .build();
+        main.getRange(r, mPortal + 1).setRichTextValue(rt);
+      }
+    }
+
+    // Notes: auto-link any raw URLs inside the text
+    if (mNotes !== null) {
+      const notesText = String(rowsToAppend[i][mNotes] || "");
+      const rtNotes = buildRichTextPreservingLinks_(notesText, null); // uses helper
+      main.getRange(r, mNotes + 1).setRichTextValue(rtNotes);
+    }
+  }
+}
+
   }
 
   if (pipedUpdates.length) {
@@ -807,7 +909,7 @@ function pipeCanvasHitsToMainMenu() {
   // refreshTriageForMainMenu();
 
   ss.toast(`Piped ${rowsToAppend.length} Canvas hit(s) into Main Menu.`, "Autoship", 6);
-}
+
 
 /**
  * Very fast “good enough” extractor so the sidebar never hangs.
@@ -1116,6 +1218,7 @@ function syncSatisfiedToResults() {
   const mainRange = main.getRange(HEADER_ROW, 1, numRows, lastCol);
 
   const mainValues = mainRange.getValues();
+  const mainDisplay = mainRange.getDisplayValues(); // ✅ dropdown-safe
   const mainRich = mainRange.getRichTextValues();
   const mainFormulas = mainRange.getFormulas();
 
@@ -1156,88 +1259,106 @@ function syncSatisfiedToResults() {
   const rowsToRemove = [];
   let moved = 0;
 
- for (let i = 1; i < mainValues.length; i++) {
-  const row = mainValues[i];
-  const name = (row[idxName] || "").toString().trim();
-  if (!name) continue;
+  for (let i = 1; i < mainValues.length; i++) {
+    const row = mainValues[i];
+    const name = (row[idxName] || "").toString().trim();
+    if (!name) continue;
 
-  // ✅ Results sync is based on TRIAGE == Satisfied
-  const triageNorm = normalize_((row[idxTriage] ?? "").toString());
-  if (triageNorm !== "satisfied") continue;
+    // ✅ Satisfied check from DISPLAY values
+    const triageNorm = normalize_(mainDisplay[i][idxTriage] || "");
+    if (triageNorm !== "satisfied") continue;
 
-  const key = name.toLowerCase();
-  if (existing.has(key)) continue;
+    const key = name.toLowerCase();
+    if (existing.has(key)) continue;
 
-  const out = new Array(resValues[0].length).fill("");
+    const out = new Array(resValues[0].length).fill("");
 
-  out[rName] = row[idxName];
-  out[rDue] = row[idxDue];
-  out[rDifficulty] = row[idxDifficulty];
-  out[rNotes] = row[idxNotes];
-  out[rPortal] = row[idxPortal];
+    out[rName] = row[idxName];
+    out[rDue] = row[idxDue];
+    out[rDifficulty] = row[idxDifficulty];
+    out[rNotes] = row[idxNotes];
+    out[rPortal] = row[idxPortal];
 
-  if (rReq !== null && idxReq !== null) out[rReq] = row[idxReq];
+    if (rReq !== null && idxReq !== null) out[rReq] = row[idxReq];
 
-  // --- Application File chips ---
-  if (rAppFile !== null && idxAppFile !== null) {
-    out[rAppFile] = chipFormulaFromCell_(
-      row[idxAppFile],
-      mainRich[i][idxAppFile],
-      mainFormulas[i][idxAppFile]
-    );
-  }
+    if (rAppFile !== null && idxAppFile !== null) {
+      out[rAppFile] = chipFormulaFromCell_(
+        row[idxAppFile],
+        mainRich[i][idxAppFile],
+        mainFormulas[i][idxAppFile]
+      );
+    }
 
-  if (rAddl !== null && idxAddl !== null) {
-    out[rAddl] = chipFormulaFromCell_(
-      row[idxAddl],
-      mainRich[i][idxAddl],
-      mainFormulas[i][idxAddl]
-    );
-  }
+    if (rAddl !== null && idxAddl !== null) {
+      out[rAddl] = chipFormulaFromCell_(
+        row[idxAddl],
+        mainRich[i][idxAddl],
+        mainFormulas[i][idxAddl]
+      );
+    }
 
-  results.appendRow(out);
-  const appendedRow = results.getLastRow();
+    results.appendRow(out);
+    const appendedRow = results.getLastRow();
 
-  // Preserve rich links in portal/files (if present)
-  enqueuePreservedLinkWrite_({
-    linkWrites,
-    srcValues: row,
-    srcRichRow: mainRich[i],
-    srcFormulaRow: mainFormulas[i],
-    srcIdx: idxPortal,
-    dstRow: appendedRow,
-    dstCol1Based: rPortal + 1
-  });
-
-  if (idxAppFile !== null && rAppFile !== null) {
     enqueuePreservedLinkWrite_({
       linkWrites,
       srcValues: row,
       srcRichRow: mainRich[i],
       srcFormulaRow: mainFormulas[i],
-      srcIdx: idxAppFile,
+      srcIdx: idxPortal,
       dstRow: appendedRow,
-      dstCol1Based: rAppFile + 1
+      dstCol1Based: rPortal + 1
+    });
+
+    if (idxAppFile !== null && rAppFile !== null) {
+      enqueuePreservedLinkWrite_({
+        linkWrites,
+        srcValues: row,
+        srcRichRow: mainRich[i],
+        srcFormulaRow: mainFormulas[i],
+        srcIdx: idxAppFile,
+        dstRow: appendedRow,
+        dstCol1Based: rAppFile + 1
+      });
+    }
+
+    if (idxAddl !== null && rAddl !== null) {
+      enqueuePreservedLinkWrite_({
+        linkWrites,
+        srcValues: row,
+        srcRichRow: mainRich[i],
+        srcFormulaRow: mainFormulas[i],
+        srcIdx: idxAddl,
+        dstRow: appendedRow,
+        dstCol1Based: rAddl + 1
+      });
+    }
+
+    existing.add(key);
+    moved++;
+    rowsToRemove.push(HEADER_ROW + i); // ✅ absolute row in MAIN
+  }
+
+  // Apply link writes in Results
+  if (linkWrites.length) {
+    linkWrites.forEach(w => {
+      const cell = results.getRange(w.row, w.col);
+      if (w.formula) cell.setFormula(w.formula);
+      else if (w.richText) cell.setRichTextValue(w.richText);
     });
   }
 
-  if (idxAddl !== null && rAddl !== null) {
-    enqueuePreservedLinkWrite_({
-      linkWrites,
-      srcValues: row,
-      srcRichRow: mainRich[i],
-      srcFormulaRow: mainFormulas[i],
-      srcIdx: idxAddl,
-      dstRow: appendedRow,
-      dstCol1Based: rAddl + 1
-    });
+  // ✅ Delete from Main bottom-up
+  if (rowsToRemove.length) {
+    rowsToRemove.sort((a, b) => b - a);
+    for (const r of rowsToRemove) main.deleteRow(r);
   }
 
-  existing.add(key);
-  moved++;
-  rowsToRemove.push(HEADER_ROW + i);
-}
-// <-- Add this closing brace to end syncSatisfiedToResults
+  ss.toast(
+    moved ? `Moved ${moved} satisfied row(s) to Results.` : "No rows with Triage = Satisfied.",
+    "Scholarship Tools",
+    6
+  );
 }
 
 function syncSurrenderedToSheet() {
@@ -1302,7 +1423,7 @@ function syncSurrenderedToSheet() {
   const todayStr = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd");
 
   for (let i = 1; i < mainValues.length; i++) {
-  // ✅ Surrendered sync is based on STATUS == Surrendered (use display values)
+  //  Surrendered sync is based on STATUS == Surrendered (use display values)
   const statusDisp = String(mainDisplay[i][idxStatus] ?? "").trim();
   const statusNorm = normalize_(statusDisp);
   if (statusNorm !== "surrendered") continue;
@@ -1373,6 +1494,72 @@ function extractEssayPromptFromUrlOrPdf_(url) {
   }
 
   return pack;
+}
+
+function extractLinkRunsFromRichText_(rt) {
+  const out = [];
+  if (!rt) return out;
+
+  const runs = rt.getRuns ? rt.getRuns() : [];
+  runs.forEach(run => {
+    const url = run.getLinkUrl();
+    const txt = run.getText();
+    if (url && txt) out.push({ text: txt, url: url });
+  });
+
+  // whole-cell link fallback
+  try {
+    const whole = rt.getLinkUrl && rt.getLinkUrl();
+    const wholeText = rt.getText && rt.getText();
+    if (whole && wholeText) out.push({ text: wholeText, url: whole });
+  } catch (_) {}
+
+  // de-dupe
+  const seen = new Set();
+  return out.filter(x => {
+    const k = x.url + "||" + x.text;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+function buildRichTextPreservingLinks_(newText, oldRichText) {
+  const text = String(newText ?? "");
+  const builder = SpreadsheetApp.newRichTextValue().setText(text);
+
+  const runs = extractLinkRunsFromRichText_(oldRichText);
+
+  // Re-apply old links where the same linked text appears in new text
+  runs.forEach(r => {
+    const needle = String(r.text || "");
+    if (!needle) return;
+
+    let idx = 0;
+    while (idx < text.length) {
+      const at = text.indexOf(needle, idx);
+      if (at === -1) break;
+      builder.setLinkUrl(at, at + needle.length, r.url);
+      idx = at + needle.length;
+    }
+  });
+
+  // Also auto-link any raw URLs that appear in new text
+  const urlRegex = /https?:\/\/[^\s)"'>]+/g;
+  let m;
+  while ((m = urlRegex.exec(text)) !== null) {
+    const u = m[0];
+    builder.setLinkUrl(m.index, m.index + u.length, u);
+  }
+
+  return builder.build();
+}
+
+function setCellTextPreserveLinks_(sheet, row, col, newText) {
+  const cell = sheet.getRange(row, col);
+  const oldRT = cell.getRichTextValue();
+  const rt = buildRichTextPreservingLinks_(newText, oldRT);
+  cell.setRichTextValue(rt);
 }
 
 function fetchHtmlAsText_(url) {
@@ -2210,6 +2397,70 @@ function clampToOptions_(raw, options, fallback) {
     if (no.includes(r) || r.includes(no)) return o;
   }
   return fallback;
+}
+
+function buildExistingScholarshipKeySet_() {
+  const ss = SpreadsheetApp.getActive();
+
+  const sheets = [MAIN_SHEET, RESULTS_SHEET, SURRENDERED_SHEET]
+    .map(n => ss.getSheetByName(n))
+    .filter(Boolean);
+
+  const existing = new Set();
+
+  sheets.forEach(sh => {
+    const lastRow = sh.getLastRow();
+    const lastCol = sh.getLastColumn();
+    if (lastRow < 2) return;
+
+    const headers = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
+    const h = buildHeaderIndex(headers);
+
+    const idxName = optionalIndex_(h, "Scholarship Name");
+    const idxPortal = optionalIndex_(h, "Application Portal");
+
+    const values = sh.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, lastCol).getValues();
+
+    values.forEach(r => {
+      const name = idxName !== null ? String(r[idxName] || "").trim() : "";
+      const portal = idxPortal !== null ? String(r[idxPortal] || "").trim() : "";
+
+      if (portal) existing.add("portal:" + canonicalizeUrl_(portal));
+      if (name) existing.add("name:" + normalize_(name));
+    });
+  });
+
+  return existing;
+}
+
+function canvasFingerprint_(title, body, url) {
+  const link = canonicalizeUrl_(extractFirstUrl_(body) || url || "");
+  const t = normalize_(title || "");
+  const core = link ? ("link:" + link) : ("title:" + t);
+  return core;
+}
+
+function extractFirstUrl_(text) {
+  const m = String(text || "").match(/https?:\/\/[^\s)"'>]+/i);
+  return m ? m[0] : "";
+}
+
+function canonicalizeUrl_(u) {
+  if (!u) return "";
+  let s = String(u).trim();
+  if (!/^https?:\/\//i.test(s)) return s;
+
+  // strip common tracking query params
+  const parts = s.split("?");
+  let base = parts[0].replace(/\/+$/, ""); // no trailing slash
+  if (parts.length === 1) return base;
+
+  const query = parts[1]
+    .split("&")
+    .filter(kv => kv && !/^utm_/i.test(kv) && !/^fbclid=/i.test(kv) && !/^gclid=/i.test(kv))
+    .join("&");
+
+  return query ? (base + "?" + query) : base;
 }
 
 // --- parse Due Date robustly ---
