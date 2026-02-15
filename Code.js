@@ -9,6 +9,8 @@ const MAIN_SHEET = "Main Menu";
 const RESULTS_SHEET = "Results";
 const SURRENDERED_SHEET = "Surrendered";
 const HEADER_ROW = 1;
+const CANVAS_CACHE_TTL_SECONDS = 6 * 60 * 60; // 6 hours (change to 24h if you want)
+const CANVAS_COURSES_CACHE_KEY = "canvas:courses:v1";
 
 function testToast_() {
   SpreadsheetApp.getActive().toast("Autoship is LIVE", "OK", 3);
@@ -362,6 +364,17 @@ const SCAN_PROFILE = {
  * ENTRY POINT
  ***************/
 function scanCanvasForScholarships() {
+  const props = PropertiesService.getScriptProperties();
+  const last = Number(props.getProperty("canvas:lastScanMs") || "0");
+  const now = Date.now();
+
+  // 5 minute cooldown
+  if (now - last < 5 * 60 * 1000) {
+    SpreadsheetApp.getActive().toast("Canvas scan blocked (cooldown 5 min).", "Autoship", 5);
+    return;
+  }
+  props.setProperty("canvas:lastScanMs", String(now));
+
   const courses = canvasListActiveCourses_();
 
   const counselorCourses = pickCourses_(courses, COURSE_MATCH.COUNSELOR_EXACT);
@@ -469,35 +482,44 @@ function canvasToken_() {
   return v.trim();
 }
 
-function canvasFetchJson_(path, params) {
-  const base = canvasBaseUrl_();
-  const url = buildUrl_(base + path, params || {});
-  Logger.log("Canvas URL: " + url);   // <-- add this line
+function canvasFetchJson_(url) {
+  try {
+    const res = UrlFetchApp.fetch(url, {
+      headers: canvasAuthHeaders_(),
+      muteHttpExceptions: true,
+      followRedirects: true
+    });
 
-  const res = UrlFetchApp.fetch(url, {
-    method: "get",
-    muteHttpExceptions: true,
-    headers: { Authorization: "Bearer " + canvasToken_() }
-  });
-
-  const code = res.getResponseCode();
-  if (code < 200 || code >= 300) {
-    throw new Error(`Canvas API error ${code}: ${res.getContentText().slice(0, 200)}`);
+    const code = res.getResponseCode();
+    if (code < 200 || code >= 300) {
+      throw new Error(`Canvas HTTP ${code}: ${res.getContentText().slice(0, 300)}`);
+    }
+    return JSON.parse(res.getContentText() || "null");
+  } catch (e) {
+    const msg = String(e && e.message ? e.message : e);
+    if (/Bandwidth quota exceeded/i.test(msg)) {
+      // ✅ stop hard + tell you what to do
+      throw new Error("Apps Script UrlFetch bandwidth quota exceeded. Use cached courses + reduce include[]=term + avoid repeated scans.");
+    }
+    throw e;
   }
-  return JSON.parse(res.getContentText() || "null");
 }
 
 function canvasListActiveCourses_() {
-  const data = canvasFetchJson_("/api/v1/courses", {
-    per_page: 100,
-    "include[]": "term",
-    "fields[]": "id,name,course_code,workflow_state,access_restricted_by_date"
-  });
+  const cached = cacheGetJson_(CANVAS_COURSES_CACHE_KEY);
+  if (cached && Array.isArray(cached) && cached.length) {
+    Logger.log(`Canvas courses: using cache (${cached.length})`);
+    return cached;
+  }
 
-  return (data || []).map(c => ({
-    id: c.id,
-    name: c.name || c.course_code || `Course ${c.id}`
-  }));
+  const url = CANVAS_BASE + "/api/v1/courses?per_page=60"
+    + "&fields[]=id&fields[]=name&fields[]=course_code&fields[]=workflow_state&fields[]=access_restricted_by_date";
+
+  const courses = canvasFetchPaged_(url);
+
+  cacheSetJson_(CANVAS_COURSES_CACHE_KEY, courses, CANVAS_CACHE_TTL_SECONDS);
+  Logger.log(`Canvas courses: fetched+cached (${courses.length})`);
+  return courses;
 }
 
 function canvasFetchAnnouncements_(courseId, lookbackDays) {
@@ -861,54 +883,53 @@ function pipeCanvasHitsToMainMenu() {
     existing.add("portal:" + url);
   }
 
-  if (rowsToAppend.length) {
-  const startRow = main.getLastRow() + 1;
+    if (rowsToAppend.length) {
+    const startRow = main.getLastRow() + 1;
 
-  // 1) fast append
-  main.getRange(startRow, 1, rowsToAppend.length, rowsToAppend[0].length)
-    .setValues(rowsToAppend);
+    // 1) fast append
+    main.getRange(startRow, 1, rowsToAppend.length, rowsToAppend[0].length)
+      .setValues(rowsToAppend);
 
-  // 2) rebuild RichText for link-sensitive columns (Notes + Portal)
-  for (let i = 0; i < rowsToAppend.length; i++) {
-    const r = startRow + i;
+    // 2) rebuild RichText for link-sensitive columns (Notes + Portal)
+    for (let i = 0; i < rowsToAppend.length; i++) {
+      const rOut = startRow + i;
 
-    // Portal: make clickable if it’s a URL
-    if (mPortal !== null) {
-      const portal = String(rowsToAppend[i][mPortal] || "").trim();
-      if (portal && /^https?:\/\//i.test(portal)) {
-        const rt = SpreadsheetApp.newRichTextValue()
-          .setText(portal)
-          .setLinkUrl(portal)
-          .build();
-        main.getRange(r, mPortal + 1).setRichTextValue(rt);
+      // Portal: make clickable if it’s a URL
+      if (mPortal !== null) {
+        const portal = String(rowsToAppend[i][mPortal] || "").trim();
+        if (portal && /^https?:\/\//i.test(portal)) {
+          const rt = SpreadsheetApp.newRichTextValue()
+            .setText(portal)
+            .setLinkUrl(portal)
+            .build();
+          main.getRange(rOut, mPortal + 1).setRichTextValue(rt);
+        }
+      }
+
+      // Notes: auto-link any raw URLs inside the text
+      if (mNotes !== null) {
+        const notesText = String(rowsToAppend[i][mNotes] || "");
+        const rtNotes = buildRichTextPreservingLinks_(notesText, null);
+        main.getRange(rOut, mNotes + 1).setRichTextValue(rtNotes);
       }
     }
-
-    // Notes: auto-link any raw URLs inside the text
-    if (mNotes !== null) {
-      const notesText = String(rowsToAppend[i][mNotes] || "");
-      const rtNotes = buildRichTextPreservingLinks_(notesText, null); // uses helper
-      main.getRange(r, mNotes + 1).setRichTextValue(rtNotes);
-    }
-  }
-}
-
   }
 
+  // ✅ write back "Piped" status (THIS must be inside the function)
   if (pipedUpdates.length) {
-    // Write back "Piped" status
-    const pipedCol = idxPiped + 1; // 1-based for Range
+    const pipedCol = idxPiped + 1; // 1-based
     const updatesRange = intake.getRange(2, pipedCol, intakeValues.length, 1);
     const colVals = updatesRange.getValues();
 
-    pipedUpdates.forEach(([i, val]) => colVals[i][0] = val);
+    pipedUpdates.forEach(([i, val]) => {
+      colVals[i][0] = val;
+    });
+
     updatesRange.setValues(colVals);
   }
 
-  // Optional: refresh triage after adding
-  // refreshTriageForMainMenu();
-
   ss.toast(`Piped ${rowsToAppend.length} Canvas hit(s) into Main Menu.`, "Autoship", 6);
+} // ✅ end pipeCanvasHitsToMainMenu
 
 
 /**
@@ -1248,6 +1269,13 @@ function syncSatisfiedToResults() {
   const rReq = optionalIndex_(rh, COL_REQUIREMENTS);
   const rAppFile = optionalIndex_(rh, COL_APPLICATION_FILE);
   const rAddl = optionalIndex_(rh, COL_ADDITIONAL_APPLICATION_FILE);
+  const idxEvent = optionalIndex_(h, CAL_EVENT_COL_NAME); // may be null
+
+
+    // --- Calendar (optional but recommended) ---
+  const calId = PropertiesService.getScriptProperties()
+    .getProperty(DEFAULT_CAL_ID_PROP) || "primary";
+  const cal = CalendarApp.getCalendarById(calId);
 
   const existing = new Set();
   for (let i = 1; i < resValues.length; i++) {
@@ -1260,16 +1288,19 @@ function syncSatisfiedToResults() {
   let moved = 0;
 
   for (let i = 1; i < mainValues.length; i++) {
-    const row = mainValues[i];
-    const name = (row[idxName] || "").toString().trim();
+    const name = String(mainValues[i][idxName] || "").trim();
     if (!name) continue;
 
-    // ✅ Satisfied check from DISPLAY values
-    const triageNorm = normalize_(mainDisplay[i][idxTriage] || "");
+    const triageDisp = String(mainDisplay[i][idxTriage] || "");
+    const triageNorm = normalize_(triageDisp);
+
+    // DEBUG: log first 25 rows
+    if (i <= 25) Logger.log(`Row ${HEADER_ROW + i}: triageDisp="${triageDisp}" triageNorm="${triageNorm}"`);
+
     if (triageNorm !== "satisfied") continue;
 
     const key = name.toLowerCase();
-    if (existing.has(key)) continue;
+    const row = mainValues[i];
 
     const out = new Array(resValues[0].length).fill("");
 
@@ -1300,6 +1331,17 @@ function syncSatisfiedToResults() {
     results.appendRow(out);
     const appendedRow = results.getLastRow();
 
+    // ✅ delete calendar event for satisfied rows we’re moving
+    if (idxEvent !== null && cal) {
+      const eventId = String(mainValues[i][idxEvent] || "").trim();
+      if (eventId) {
+        const ev = safeGetEventById_(cal, eventId);
+        if (ev) ev.deleteEvent();
+        // optional: clear it in-memory so when you write main back later it’s blank
+        // mainValues[i][idxEvent] = "";
+      }
+    }
+
     enqueuePreservedLinkWrite_({
       linkWrites,
       srcValues: row,
@@ -1309,6 +1351,7 @@ function syncSatisfiedToResults() {
       dstRow: appendedRow,
       dstCol1Based: rPortal + 1
     });
+
 
     if (idxAppFile !== null && rAppFile !== null) {
       enqueuePreservedLinkWrite_({
@@ -1336,7 +1379,7 @@ function syncSatisfiedToResults() {
 
     existing.add(key);
     moved++;
-    rowsToRemove.push(HEADER_ROW + i); // ✅ absolute row in MAIN
+    rowsToRemove.push(HEADER_ROW + i);
   }
 
   // Apply link writes in Results
@@ -2096,7 +2139,196 @@ function refreshTriageForMainMenu() {
  * MAIN MENU → GOOGLE CALENDAR
  ***********************/
 
+// Calendar columns / properties
 const CAL_EVENT_COL_NAME = "Calendar Event Id";
+const DEFAULT_CAL_ID_PROP = "SCHOLARSHIP_CALENDAR_ID";
+
+// Which edits should trigger an auto-sync of that one row
+const CAL_WATCH_HEADERS = ["Due Date", "Triage", "Status", "Scholarship Name", "Application Portal", "Notes"];
+
+/**
+ * Installable trigger (required to call CalendarApp reliably)
+ * Run ONCE manually from Apps Script.
+ */
+function installCalendarAutoSyncTrigger() {
+  const ss = SpreadsheetApp.getActive();
+
+  // remove old triggers pointing to this handler to avoid duplicates
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction && t.getHandlerFunction() === "calendarAutoSyncOnEdit") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger("calendarAutoSyncOnEdit")
+    .forSpreadsheet(ss)
+    .onEdit()
+    .create();
+
+  ss.toast("Installed: Calendar auto-sync on edit ✅", "Autoship", 5);
+}
+
+/**
+ * Trigger handler: when you edit Main Menu, auto-sync only that row.
+ */
+function calendarAutoSyncOnEdit(e) {
+  try {
+    if (!e || !e.range) return;
+
+    const sh = e.range.getSheet();
+    if (!sh) return;
+
+    // Only react on Main Menu
+    if (sh.getName() !== MAIN_SHEET) return;
+
+    // Ignore header edits
+    const row = e.range.getRow();
+    if (row <= HEADER_ROW) return;
+
+    // Only react if the edited column is one of our watch columns
+    const lastCol = sh.getLastColumn();
+    const headers = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
+    const h = buildHeaderIndex(headers);
+
+    const editedCol = e.range.getColumn(); // 1-based
+    const editedHeader = headers[editedCol - 1] ? String(headers[editedCol - 1]).trim() : "";
+
+    if (editedHeader && !CAL_WATCH_HEADERS.includes(editedHeader)) return;
+
+    // Sync just this one row
+    syncScholarshipCalendarForRow_(sh, row, h);
+  } catch (err) {
+    Logger.log("calendarAutoSyncOnEdit error: " + (err && err.message ? err.message : err));
+  }
+}
+
+/**
+ * Sync ONE row of Main Menu to Calendar (create/update/delete).
+ * Deletes event if:
+ *  - Triage == Satisfied
+ *  - Due Date blank
+ *  - Status in REMOVE_EVENT_STATUS_VALUES
+ *  - Triage in REMOVE_EVENT_TRIAGE_VALUES
+ */
+function syncScholarshipCalendarForRow_(sh, rowNumber, headerIndexMap) {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+
+  try {
+    const h = headerIndexMap || buildHeaderIndex(
+      sh.getRange(HEADER_ROW, 1, 1, sh.getLastColumn()).getValues()[0]
+    );
+
+    const idxName   = optionalIndex_(h, "Scholarship Name");
+    const idxPortal = optionalIndex_(h, COL_APPLICATION_PORTAL);
+    const idxDue    = optionalIndex_(h, "Due Date");
+    const idxTriage = optionalIndex_(h, "Triage");
+    const idxStatus = optionalIndex_(h, "Status");
+    const idxNotes  = optionalIndex_(h, "Notes");
+    const idxEvent  = optionalIndex_(h, CAL_EVENT_COL_NAME);
+
+    if (idxName === null || idxPortal === null || idxDue === null) return;
+    if (idxEvent === null) return; // if you don't have the column, nothing to store
+
+    const lastCol = sh.getLastColumn();
+    const rng = sh.getRange(rowNumber, 1, 1, lastCol);
+
+    const values  = rng.getValues()[0];
+    const display = rng.getDisplayValues()[0];
+
+    const name   = String(values[idxName] || "").trim();
+    const portal = String(values[idxPortal] || "").trim();
+    const dueRaw = values[idxDue];
+    const triage = idxTriage !== null ? String(display[idxTriage] || "").trim().toLowerCase() : "";
+    const status = idxStatus !== null ? String(display[idxStatus] || "").trim().toLowerCase() : "";
+    const notes  = idxNotes !== null ? String(values[idxNotes] || "") : "";
+    let eventId  = String(values[idxEvent] || "").trim();
+
+    // Calendar
+    const calId = PropertiesService.getScriptProperties().getProperty(DEFAULT_CAL_ID_PROP) || "primary";
+    const cal = CalendarApp.getCalendarById(calId);
+    if (!cal) throw new Error(`Could not open calendar: ${calId}`);
+
+    // Removal conditions
+    const dueDate = parseDueDate_(dueRaw); // you already have this helper
+    const shouldRemove =
+      !name ||
+      !portal ||
+      !dueDate ||
+      (triage && REMOVE_EVENT_TRIAGE_VALUES.includes(triage)) ||
+      (status && REMOVE_EVENT_STATUS_VALUES.includes(status)) ||
+      (triage === "satisfied"); // <- your new rule
+
+    if (shouldRemove) {
+      if (eventId) {
+        const ev = safeGetEventById_(cal, eventId);
+        if (ev) ev.deleteEvent();
+        sh.getRange(rowNumber, idxEvent + 1).setValue(""); // clear stored id
+      }
+      return;
+    }
+
+    // Build event
+    const allDay = new Date(dueDate.getFullYear(), dueDate.getMonth(), dueDate.getDate());
+    const eventTitle = `Scholarship Due: ${name}`;
+    const eventDesc =
+      `Scholarship: ${name}\n` +
+      `Portal: ${portal}\n` +
+      `Sheet: ${MAIN_SHEET}\n` +
+      (notes ? `\nNotes:\n${notes}\n` : "");
+
+    // Create if missing
+    if (!eventId) {
+      const ev = cal.createAllDayEvent(eventTitle, allDay, {
+        description: eventDesc,
+        location: portal
+      });
+      applyScholarshipReminders_(ev);
+      sh.getRange(rowNumber, idxEvent + 1).setValue(ev.getId());
+      return;
+    }
+
+    // Update existing (or recreate if date changed)
+    let ev = safeGetEventById_(cal, eventId);
+    if (!ev) {
+      const newEv = cal.createAllDayEvent(eventTitle, allDay, {
+        description: eventDesc,
+        location: portal
+      });
+      applyScholarshipReminders_(newEv);
+      sh.getRange(rowNumber, idxEvent + 1).setValue(newEv.getId());
+      return;
+    }
+
+    const evDate = ev.getAllDayStartDate ? ev.getAllDayStartDate() : ev.getStartTime();
+    const evDay = new Date(evDate.getFullYear(), evDate.getMonth(), evDate.getDate());
+
+    const needsDate = evDay.getTime() !== allDay.getTime();
+    const needsTitle = ev.getTitle() !== eventTitle;
+    const needsLoc = (ev.getLocation() || "") !== portal;
+    const needsDesc = (ev.getDescription() || "") !== eventDesc;
+
+    if (needsDate) {
+      ev.deleteEvent();
+      const repl = cal.createAllDayEvent(eventTitle, allDay, {
+        description: eventDesc,
+        location: portal
+      });
+      applyScholarshipReminders_(repl);
+      sh.getRange(rowNumber, idxEvent + 1).setValue(repl.getId());
+      return;
+    }
+
+    if (needsTitle) ev.setTitle(eventTitle);
+    if (needsLoc) ev.setLocation(portal);
+    if (needsDesc) ev.setDescription(eventDesc);
+
+    ensureScholarshipReminders_(ev);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 
 function syncScholarshipDeadlinesToCalendar() {
   const ss = SpreadsheetApp.getActive();
@@ -2149,7 +2381,10 @@ function syncScholarshipDeadlinesToCalendar() {
 
     const shouldRemove =
       (triage && REMOVE_EVENT_TRIAGE_VALUES.includes(triage)) ||
-      (status && REMOVE_EVENT_STATUS_VALUES.includes(status));
+      (status && REMOVE_EVENT_STATUS_VALUES.includes(status)) ||
+      (triage === "satisfied") ||   
+      (!dueRaw);                    
+
 
     // If marked submitted/surrendered: delete calendar event and clear id
     if (shouldRemove) {
@@ -2323,9 +2558,12 @@ function normalize_(s) {
   return (s ?? "")
     .toString()
     .replace(/\u00A0/g, " ")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "") // zero-width chars
+    .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
 }
+
 function normHeader_(s) {
   return (s ?? "").toString().trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -2746,6 +2984,44 @@ function canvasDeepFetchTextForModuleItem_(courseId, mi) {
   }
 }
 
+function cacheSetJson_(key, obj, ttlSeconds) {
+  const cache = CacheService.getScriptCache();
+  const str = JSON.stringify(obj);
+  // Cache has size limits; if too big, fallback to Properties (chunked)
+  try {
+    cache.put(key, str, ttlSeconds);
+    return true;
+  } catch (e) {
+    // fallback: chunk into ScriptProperties
+    const props = PropertiesService.getScriptProperties();
+    const chunkSize = 8000; // safe-ish
+    const chunks = [];
+    for (let i = 0; i < str.length; i += chunkSize) chunks.push(str.slice(i, i + chunkSize));
+    props.setProperty(key + ":n", String(chunks.length));
+    chunks.forEach((c, i) => props.setProperty(key + ":" + i, c));
+    props.setProperty(key + ":exp", String(Date.now() + ttlSeconds * 1000));
+    return true;
+  }
+}
+
+function cacheGetJson_(key) {
+  const cache = CacheService.getScriptCache();
+  const hit = cache.get(key);
+  if (hit) return JSON.parse(hit);
+
+  const props = PropertiesService.getScriptProperties();
+  const exp = Number(props.getProperty(key + ":exp") || "0");
+  if (!exp || Date.now() > exp) return null;
+
+  const n = Number(props.getProperty(key + ":n") || "0");
+  if (!n) return null;
+
+  let str = "";
+  for (let i = 0; i < n; i++) str += (props.getProperty(key + ":" + i) || "");
+  return str ? JSON.parse(str) : null;
+}
+
+
 function installDailyTriageRefreshTrigger() {
   // runs around 6am in your spreadsheet’s timezone
   ScriptApp.newTrigger("refreshTriageForMainMenu")
@@ -2768,10 +3044,11 @@ function findColByNorm_(headerRow, targetNorm) {
 }
 
 function safeGetEventById_(cal, eventId) {
+  if (!cal || !eventId) return null;
   try {
     return cal.getEventById(eventId);
   } catch (e) {
-    return null;
+    return null; // prevents crash if event doesn't exist
   }
 }
 
