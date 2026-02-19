@@ -1,22 +1,67 @@
-// PUSH TEST: 2026-02-14 11:xxclasp status
-
-// @ts-nocheck
-/*************************************************
- * GLOBAL CONFIG
- *************************************************/
- // ===== GLOBAL CONSTANTS (LOAD FIRST) =====
 const MAIN_SHEET = "Main Menu";
 const RESULTS_SHEET = "Results";
 const SURRENDERED_SHEET = "Surrendered";
 const HEADER_ROW = 1;
-const CANVAS_CACHE_TTL_SECONDS = 6 * 60 * 60; // 6 hours (change to 24h if you want)
-const CANVAS_COURSES_CACHE_KEY = "canvas:courses:v1";
 
-function testToast_() {
-  SpreadsheetApp.getActive().toast("Autoship is LIVE", "OK", 3);
-}
+// Canvas config
+const CANVAS_COURSES_CACHE_KEY = "CANVAS_ACTIVE_COURSES_v1";
+const CANVAS_COURSES_CACHE_SECONDS = 6 * 60 * 60; // 6 hours
+const CANVAS_MAX_COURSES_PER_RUN = 40;            // hard cap
+const CANVAS_SLEEP_MS = 350;
 
-const GEMINI_MODEL = "gemini-2.5-flash"; // model string you chose
+// Force/target courses
+const FORCE_CANVAS_COURSE_IDS = [302960];
+
+const TARGET_CANVAS_COURSE_IDS = [
+  138471, // MHS Counselors
+  239025  // Class of 2026
+];
+
+const TARGET_COURSE_IDS = {
+  COUNSELOR: [138471],
+  CLASS_2026: [239025]
+};
+
+// ===== ELIGIBILITY PROFILE (Kevin) =====
+const USER_PROFILE = {
+  grade_level: "Senior",
+  hs_class_year: 2026,
+  age: 18,
+  state: "TX",
+  city: "Arlington",
+  gender: "Male",
+  ethnicity: "asian",
+  intended_majors: ["biochem", "biochemistry", "biomedical engineering", "bme", "bioengineering"],
+  gpa_unweighted: 3.98,
+  gpa_weighted: 4.78,
+  family_income: 133000,
+  sai: 20000,
+
+  // "within 10000 is fine" rule for income + SAI cutoffs
+  tolerance_income: 10000,
+  tolerance_sai: 10000
+};
+
+// ✅ IMPORTANT: your code references APPLICANT_PROFILE in multiple places
+const APPLICANT_PROFILE = {
+  gradeLevel: USER_PROFILE.grade_level,
+  hsClassYear: USER_PROFILE.hs_class_year,
+  age: USER_PROFILE.age,
+  state: USER_PROFILE.state,
+  city: USER_PROFILE.city,
+  gender: USER_PROFILE.gender,
+  ethnicity: USER_PROFILE.ethnicity,
+  intendedMajors: USER_PROFILE.intended_majors,
+  gpaUnweighted: USER_PROFILE.gpa_unweighted,
+  gpaWeighted: USER_PROFILE.gpa_weighted,
+  familyIncome: USER_PROFILE.family_income,
+  sai: USER_PROFILE.sai,
+  incomeTolerance: USER_PROFILE.tolerance_income,
+  saiTolerance: USER_PROFILE.tolerance_sai
+};
+
+// Gemini
+const GEMINI_MODEL = "gemini-2.5-flash";
 
 // Your Requirements multi-select token that indicates writing
 const ESSAY_REQUIREMENT_TOKEN = "Essay(s)";
@@ -26,59 +71,50 @@ const COL_APPLICATION_PORTAL = "Application Portal";
 const COL_REQUIREMENTS = "Requirements";
 const COL_APPLICATION_FILE = "Application File";
 const COL_ADDITIONAL_APPLICATION_FILE = "Additional Application Essay File";
+const COL_THEME = "Theme"; // ✅ must be defined BEFORE any usage
 
-// If Gemini detects PDF upload requirement, we generate a PDF and put it in Additional Application File
+// If Gemini detects PDF upload requirement
 const PDF_REQUIRED_KEYWORDS = ["pdf", "upload a pdf", "submit a pdf", "pdf format"];
 
 // Performance tuning
-const MAX_HTML_CHARS = 12000; // reduce for speed
+const MAX_HTML_CHARS = 12000;
 
 // Reminder schedule (days before due date)
-const SCHOLARSHIP_REMINDER_DAYS = [7, 3, 1]; // change if you want 14,10,5,3,1 etc.
+const SCHOLARSHIP_REMINDER_DAYS = [7, 3, 1];
 
-// Status words that should REMOVE the event
+// Status words that should REMOVE the calendar event
 const REMOVE_EVENT_TRIAGE_VALUES = ["surrendered"];
 const REMOVE_EVENT_STATUS_VALUES = ["submitted", "complete", "completed", "won", "not applying"];
 
-function discoverCanvasApiBase() {
-  const token = (PropertiesService.getScriptProperties().getProperty("CANVAS_TOKEN") || "").trim();
-  const start = "https://canvas.arlingtonisd.org/api/v1/courses?per_page=1";
+// Calendar columns / properties
+const CAL_EVENT_COL_NAME = "Calendar Event Id";
+const DEFAULT_CAL_ID_PROP = "SCHOLARSHIP_CALENDAR_ID";
+const CAL_WATCH_HEADERS = ["Due Date", "Triage", "Status", "Scholarship Name", "Application Portal", "Notes"];
 
-  const res = UrlFetchApp.fetch(start, {
-    method: "get",
-    muteHttpExceptions: true,
-    followRedirects: false, // IMPORTANT: so we can see Location
-    headers: { Authorization: "Bearer " + token }
-  });
+// Dropdown options (keep EXACT spelling to match your sheet)
+const DIFFICULTY_OPTIONS = ["Easy", "Medium", "Hard", "Fuck it", "No Idea..."];
+const TRIAGE_OPTIONS = ["Immediate", "Urgent", "Non-Urgent", "Satisfied", "Cooked"];
+const STATUS_OPTIONS = ["Not started", "Scanned", "Prepped", "In Progress", "Completed", "Surrendered"];
 
-  Logger.log("HTTP " + res.getResponseCode());
-  const headers = res.getAllHeaders();
-  Logger.log("Location: " + (headers.Location || headers.location || "(none)"));
-  Logger.log("Body preview: " + (res.getContentText() || "").slice(0, 120));
+const THEME_OPTIONS = [
+  "Biomed.", "Comp Sci.", "Business/Entrepreneurship", "Pol. Sci.", "Herritage",
+  "Engineering", "Math/Sci", "First Gen", "Broke", "English/Humanities",
+  "Leadership/Service", "None", "Other"
+];
+
+const REQUIREMENT_OPTIONS = [
+  "Essay(s)", "Rec. Letter(s)", "App./ECs", "Academics/Transcript",
+  "Field of Study", "Exam(s)", "Interview(s)", "Broke/Finances",
+  "Video/Recording", "Other"
+];
+
+/*************************************************
+ * QUICK TOAST / DEBUG
+ *************************************************/
+function testToast_() {
+  SpreadsheetApp.getActive().toast("Autoship is LIVE", "OK", 3);
 }
 
-function debugCanvasCoursesCall() {
-  const base = PropertiesService.getScriptProperties().getProperty("CANVAS_BASE_URL");
-  const token = PropertiesService.getScriptProperties().getProperty("CANVAS_TOKEN");
-
-  const url = (base || "").replace(/\/+$/, "") + "/api/v1/courses?per_page=1";
-  Logger.log("Canvas URL = " + url);
-
-  const res = UrlFetchApp.fetch(url, {
-    method: "get",
-    muteHttpExceptions: true,
-    headers: { Authorization: "Bearer " + (token || "").trim() }
-  });
-
-  Logger.log("HTTP " + res.getResponseCode());
-  Logger.log(res.getContentText().slice(0, 200));
-}
-
-function debugCanvasBaseUrlProp() {
-  const props = PropertiesService.getScriptProperties().getProperties();
-  Logger.log("CANVAS_BASE_URL = " + (props.CANVAS_BASE_URL || "(missing)"));
-  Logger.log("All props keys = " + Object.keys(props).sort().join(", "));
-}
 /*************************************************
  * MENU
  *************************************************/
@@ -112,285 +148,352 @@ function openAddSidebar() {
   SpreadsheetApp.getUi().showSidebar(html);
 }
 
-function aiAddScholarship(payload) {
-  const lock = LockService.getDocumentLock();
-  lock.waitLock(30000);
-
-  try {
-    payload = payload || {};
-    const url = (payload.url || "").toString().trim();
-    const pastedText = (payload.pastedText || "").toString();
-    const extraNotes = (payload.extraNotes || "").toString();
-
-    if (!url && pastedText.trim().length < 20) {
-      throw new Error("Provide a URL or paste at least ~20 characters of scholarship text.");
-    }
-
-    const ss = SpreadsheetApp.getActive();
-    const sh = ss.getSheetByName(MAIN_SHEET);
-    if (!sh) throw new Error(`Sheet not found: ${MAIN_SHEET}`);
-
-    const lastCol = sh.getLastColumn();
-    const headers = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
-    const h = buildHeaderIndex(headers);
-
-    // REQUIRED (based on your header row)
-    const idxName = mustIndex(h, "Scholarship Name");
-    const idxPortal = mustIndex(h, "Application Portal");
-
-    // OPTIONAL (based on your header row)
-    const idxDue = optionalIndex_(h, "Due Date");
-    const idxReq = optionalIndex_(h, "Requirements");
-    const idxNotes = optionalIndex_(h, "Notes");
-    const idxTriage = optionalIndex_(h, "Triage");
-    const idxStatus = optionalIndex_(h, "Status");
-    const idxStart = optionalIndex_(h, "Start date");
-    const idxDifficulty = optionalIndex_(h, "Difficulty");
-    const idxTheme = optionalIndex_(h, COL_THEME);
-
-    /// Fast, non-hanging extraction
-const extracted = basicExtractFromText_(pastedText, url);
-
-// ✅ Create row FIRST
-const row = new Array(lastCol).fill("");
-row[idxName] = extracted.name || "Scholarship";
-row[idxPortal] = url || "";
-
-// Detect + fill Theme + Requirements (now row exists)
-if (idxTheme !== null) {
-  row[idxTheme] = joinMultiSelect_(detectThemesFromText_(pastedText + "\n" + extraNotes));
-}
-
-if (idxReq !== null) {
-  // Merge anything extractor already set + our detector
-  const detectedReq = detectRequirementsFromText_(pastedText + "\n" + extraNotes);
-  const existingReq = (row[idxReq] || "").toString();
-
-  const merged = uniq_(
-    existingReq
-      ? existingReq.split(/[,;\n]+/).map(s => s.trim()).filter(Boolean).concat(detectedReq)
-      : detectedReq
-  );
-  row[idxReq] = joinMultiSelect_(merged);
-}
-
-// Rest of your assignments
-if (idxNotes !== null) row[idxNotes] = [extracted.notes, extraNotes].filter(Boolean).join("\n").trim();
-if (idxReq !== null && extracted.requirements) {
-  const current = (row[idxReq] || "").toString();
-  row[idxReq] = current ? joinMultiSelect_(uniq_(current.split(/[,;\n]+/).map(s=>s.trim()).filter(Boolean)
-    .concat(extracted.requirements.split(/[,;\n]+/).map(s=>s.trim()).filter(Boolean)))) : extracted.requirements;
-}
-
-if (idxDue !== null && extracted.due) row[idxDue] = extracted.due;
-
-    // optional: today
-    if (idxStart !== null) row[idxStart] = new Date();
-
-    // --- DROPDOWNS (deterministic, matches your exact options) ---
-    if (idxDifficulty !== null) {
-      row[idxDifficulty] = computeDifficulty_(extracted.difficulty); // defaults to "No Idea..."
-    }
-
-    if (idxStatus !== null) {
-      // Sidebar add = you/AI scanned requirements
-      row[idxStatus] = computeStatus_({
-        currentStatus: row[idxStatus],
-        scanned: true,
-        prepped: false,
-        completed: false,
-        surrendered: false
-      });
-    }
-
-    if (idxTriage !== null) {
-      const dueDate = (idxDue !== null) ? parseSheetDate_(row[idxDue]) : null;
-      row[idxTriage] = computeTriage_(dueDate, row[idxTriage]); // Immediate/Urgent/Non-Urgent from due date
-    }
-
-    sh.appendRow(row);
-    const addedRow = sh.getLastRow();
-
-    // Make portal clickable
-    if (row[idxPortal] && looksLikeUrl_(row[idxPortal])) {
-      const rt = SpreadsheetApp.newRichTextValue()
-        .setText(row[idxPortal])
-        .setLinkUrl(row[idxPortal])
-        .build();
-      sh.getRange(addedRow, idxPortal + 1).setRichTextValue(rt);
-    }
-
-    return { addedRow };
-  } finally {
-    lock.releaseLock();
+/*************************************************
+ * CORE HELPERS (USED ABOVE/BELOW)
+ *************************************************/
+function buildHeaderIndex(headerRow) {
+  const m = {};
+  for (let i = 0; i < headerRow.length; i++) {
+    const key = (headerRow[i] || "").toString().trim();
+    if (key) m[key] = i;
   }
+  return m;
 }
 
-function detectEssayPrompt_(text) {
-  const t = (text || "").replace(/\u00A0/g, " ").trim();
-  if (t.length < 80) return "";
+function mustIndex(map, name) {
+  if (!(name in map)) throw new Error(`Missing column header: "${name}"`);
+  return map[name];
+}
 
-  // Strong signals
-  const hasEssaySignal = /essay|personal statement|short answer|prompt|respond|write about|topic|question:/i.test(t);
-  if (!hasEssaySignal) return "";
+function optionalIndex_(map, name) {
+  return (name in map) ? map[name] : null;
+}
 
-  // Try to pull a “prompt-like” chunk:
-  // 1) If there is a "Prompt:" section
-  const m1 = t.match(/(?:^|\n)\s*(prompt|essay prompt|writing prompt)\s*[:\-]\s*([\s\S]{40,1200})/i);
-  if (m1 && m1[2]) return m1[2].trim();
+function looksLikeUrl_(s) {
+  return /^https?:\/\/\S+$/i.test(String(s || ""));
+}
 
-  // 2) If there is a question mark cluster, take surrounding text
-  const qIdx = t.search(/\?/);
-  if (qIdx !== -1) {
-    const start = Math.max(0, qIdx - 250);
-    const end = Math.min(t.length, qIdx + 900);
-    return t.slice(start, end).trim();
+function normalize_(s) {
+  return (s ?? "")
+    .toString()
+    .replace(/\u00A0/g, " ")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function norm_(s) {
+  return (s ?? "").toString().trim().toLowerCase().replace(/\u00A0/g, " ").replace(/\s+/g, " ");
+}
+
+function uniq_(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of (arr || [])) {
+    const k = norm_(x);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(x);
+  }
+  return out;
+}
+
+function joinMultiSelect_(items) {
+  return uniq_(items).join(", ");
+}
+
+function clampToOptions_(raw, options, fallback) {
+  const r = norm_(raw);
+  if (!r) return fallback;
+
+  for (const o of options) if (norm_(o) === r) return o;
+  for (const o of options) {
+    const no = norm_(o);
+    if (no.includes(r) || r.includes(no)) return o;
+  }
+  return fallback;
+}
+
+function parseDate_(s) {
+  if (!s) return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+function stripHtml_(html) {
+  if (!html) return "";
+  return String(html)
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractDriveIdFromUrl_(url) {
+  if (!url) return "";
+  const m = String(url).match(/\/d\/([a-zA-Z0-9_-]+)/);
+  return m ? m[1] : "";
+}
+
+/*************************************************
+ * TRIAGE HELPERS
+ *************************************************/
+function parseSheetDate_(v) {
+  if (!v) return null;
+  if (v instanceof Date && !isNaN(v.getTime())) return v;
+
+  const s = String(v).trim();
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return d;
+
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (m) {
+    const mm = Number(m[1]), dd = Number(m[2]), yy = Number(m[3]);
+    const yyyy = yy < 100 ? (2000 + yy) : yy;
+    const d2 = new Date(yyyy, mm - 1, dd);
+    if (!isNaN(d2.getTime())) return d2;
+  }
+  return null;
+}
+
+function daysUntil_(dueDate) {
+  if (!dueDate) return null;
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfDue = new Date(dueDate.getFullYear(), dueDate.getMonth(), dueDate.getDate());
+  const ms = startOfDue.getTime() - startOfToday.getTime();
+  return Math.floor(ms / (24 * 3600 * 1000));
+}
+
+function computeTriage_(dueDate, currentTriage) {
+  const ct = clampToOptions_(currentTriage, TRIAGE_OPTIONS, "");
+  if (ct === "Satisfied" || ct === "Cooked") return ct;
+
+  const d = daysUntil_(dueDate);
+  if (d == null) return "Non-Urgent";
+
+  if (d < 0) return "Cooked";
+  if (d <= 7) return "Immediate";
+  if (d <= 28) return "Urgent";
+  return "Non-Urgent";
+}
+
+function computeStatus_(opts) {
+  const cs = clampToOptions_(opts.currentStatus, STATUS_OPTIONS, "Not started");
+  if (cs === "Completed" || opts.completed) return "Completed";
+  if (cs === "Surrendered" || opts.surrendered) return "Surrendered";
+  if (opts.prepped) return "Prepped";
+  if (opts.scanned) return "Scanned";
+  return "Not started";
+}
+
+function computeDifficulty_(rawDifficulty) {
+  return clampToOptions_(rawDifficulty, DIFFICULTY_OPTIONS, "No Idea...");
+}
+
+/*************************************************
+ * ELIGIBILITY (USED BY CANVAS SCAN)
+ *************************************************/
+function moneyToNumber_(s) {
+  const raw = String(s || "").toLowerCase().replace(/\$/g, "").replace(/,/g, "").trim();
+  if (!raw) return null;
+  const k = raw.match(/^(\d+(?:\.\d+)?)\s*k$/);
+  if (k) return Math.round(parseFloat(k[1]) * 1000);
+  const n = parseFloat(raw);
+  return isNaN(n) ? null : Math.round(n);
+}
+
+function extractIncomeCap_(t) {
+  const m = String(t || "").match(/\b(household|family)?\s*income\s*(under|less than|below|<=?)\s*\$?\s*([\d,]{4,})\b/i);
+  if (!m) return null;
+  const n = Number(String(m[3]).replace(/,/g, ""));
+  return isNaN(n) ? null : n;
+}
+
+function extractSaiCap_(t) {
+  const m = String(t || "").match(/\b(sai|student aid index)\s*(under|less than|below|<=?)\s*([\d,]{3,})\b/i);
+  if (!m) return null;
+  const n = Number(String(m[3]).replace(/,/g, ""));
+  return isNaN(n) ? null : n;
+}
+
+function extractAnyDate_(t) {
+  const s = String(t || "");
+
+  let m = s.match(/\b(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})\b/);
+  if (m) {
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    return isNaN(d.getTime()) ? null : d;
   }
 
-  // 3) Fallback: first 900 chars if essay signal exists
-  return t.slice(0, 900).trim();
+  m = s.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/);
+  if (m) {
+    let y = Number(m[3]);
+    if (y < 100) y += 2000;
+    const d = new Date(y, Number(m[1]) - 1, Number(m[2]));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  m = s.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{1,2})(,)?\s+(20\d{2})\b/i);
+  if (m) {
+    const monthMap = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,sept:8,oct:9,nov:10,dec:11 };
+    const mm = monthMap[m[1].toLowerCase()];
+    const d = new Date(Number(m[4]), mm, Number(m[2]));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  return null;
 }
 
-function createEssayDoc_(scholarshipName, sourceUrl, promptText) {
-  const safeName = (scholarshipName || "Scholarship").toString().trim();
-  const docTitle = `${safeName} (Essay Prompt)`;
+function eligibilityGate_(text, profile) {
+  const t = String(text || "").toLowerCase();
 
-  const doc = DocumentApp.create(docTitle);
-  const body = doc.getBody();
-  body.clear();
+  // deadline passed (very conservative)
+  const dt = extractAnyDate_(t);
+  if (dt && !isNaN(dt.getTime())) {
+    const today = new Date();
+    const startToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const startDt = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
+    if (startDt.getTime() < startToday.getTime()) {
+      return { eligible: false, reason: "deadline passed" };
+    }
+  }
 
-  // Title
-  const pTitle = body.appendParagraph(docTitle);
-  pTitle.setHeading(DocumentApp.ParagraphHeading.TITLE);
-  pTitle.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 30,
-    [DocumentApp.Attribute.BOLD]: true
-  });
+  // Texas resident requirement
+  if (/\b(texas residents?|resident of texas|must be (a )?texas resident)\b/.test(t)) {
+    if (String(profile.state || "").toUpperCase() !== "TX") return { eligible: false, reason: "not Texas resident" };
+  }
 
-  // Heading 1: Source
-  const pH1 = body.appendParagraph("Source");
-  pH1.setHeading(DocumentApp.ParagraphHeading.HEADING1);
-  pH1.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 24,
-    [DocumentApp.Attribute.BOLD]: true
-  });
+  // Arlington requirement
+  if (/\b(arlington(,)? texas|city of arlington|arlington isd|arlington resident)\b/.test(t)) {
+    if (String(profile.city || "").toLowerCase() !== "arlington") return { eligible: false, reason: "not Arlington" };
+  }
 
-  // Normal text: URL
-  const pUrl = body.appendParagraph(sourceUrl || "");
-  pUrl.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 12
-  });
+  // gender requirements
+  if (/\b(male applicants only|men only|for men|must be male)\b/.test(t)) {
+    if (String(profile.gender || "").toLowerCase() !== "male") return { eligible: false, reason: "requires male" };
+  }
+  if (/\b(female applicants only|women only|for women|must be female)\b/.test(t)) {
+    if (String(profile.gender || "").toLowerCase() === "male") return { eligible: false, reason: "requires female" };
+  }
 
-  // Heading 1: Prompt
-  const pH2 = body.appendParagraph("Prompt");
-  pH2.setHeading(DocumentApp.ParagraphHeading.HEADING1);
-  pH2.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 24,
-    [DocumentApp.Attribute.BOLD]: true
-  });
+  // senior requirement
+  if (/\b(high school senior|hs senior|12th grade|grade 12)\b/.test(t)) {
+    if (String(profile.gradeLevel || "").toLowerCase() !== "senior") return { eligible: false, reason: "requires senior" };
+  }
 
-  // Normal text: prompt
-  const pPrompt = body.appendParagraph((promptText || "").trim());
-  pPrompt.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 12
-  });
+  // age strict
+  if (/\b(must be 18|age 18 required)\b/.test(t)) {
+    if (Number(profile.age) !== 18) return { eligible: false, reason: "requires age 18" };
+  }
 
-  // Heading 1: Notes
-  const pH3 = body.appendParagraph("Notes");
-  pH3.setHeading(DocumentApp.ParagraphHeading.HEADING1);
-  pH3.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 24,
-    [DocumentApp.Attribute.BOLD]: true
-  });
+  // ethnicity strict
+  if (/\b(asian (students|applicants)|aapi (students|applicants))\b/.test(t)) {
+    if (String(profile.ethnicity || "").toLowerCase() !== "asian") return { eligible: false, reason: "requires Asian/AAPI" };
+  }
 
-  // Normal placeholder
-  const pNotes = body.appendParagraph("");
-  pNotes.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 12
-  });
+  // major strict
+  const wantsBiochem = /\b(biochem|biochemistry)\b/.test(t);
+  const wantsBme = /\b(biomedical engineering|biomed eng|bme)\b/.test(t);
+  if (wantsBiochem || wantsBme) {
+    const majors = (profile.intendedMajors || []).map(x => String(x).toLowerCase());
+    if (wantsBiochem && !majors.some(m => m.includes("biochem"))) return { eligible: false, reason: "requires biochem" };
+    if (wantsBme && !majors.some(m => m.includes("biomedical"))) return { eligible: false, reason: "requires BME" };
+  }
 
-  doc.saveAndClose();
-  return doc.getUrl();
+  // income cap
+  const incomeCap = extractIncomeCap_(t);
+  if (incomeCap != null) {
+    if (Number(profile.familyIncome) > incomeCap) return { eligible: false, reason: `income>${incomeCap}` };
+  }
+
+  // SAI cap with tolerance
+  const saiCap = extractSaiCap_(t);
+  if (saiCap != null) {
+    const sai = Number(profile.sai);
+    const tol = Number(profile.saiTolerance || 0);
+    if (sai > (saiCap + tol)) return { eligible: false, reason: `sai>${saiCap}+tol` };
+  }
+
+  return { eligible: true, reason: "" };
 }
+
+/*************************************************
+ * FINGERPRINT (USED BY CANVAS DEDUPE)
+ *************************************************/
+function canvasFingerprint_(title, body, url) {
+  const s = normalize_([title, body, url].join(" | ")).slice(0, 2000);
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s);
+  return bytes.map(b => (b < 0 ? b + 256 : b).toString(16).padStart(2, "0")).join("");
+}
+
 /*******************************
- * CANVAS → AUTOSHIP INTAKE
- * Focus:
- *  - HEAVY: MHS Counselor (announcements + modules)
- *  - LIGHT: Class of 2026 (announcements + modules, fewer items)
+ * CANVAS → AUTOSHIP INTAKE (FIXED)
  *******************************/
 
 const CANVAS_INTAKE_SHEET = "Canvas Intake";
 
-// Course matching (flexible): edit if your actual course names differ
+// Course matching (optional — not required if using fixed IDs)
 const COURSE_MATCH = {
-  // Exact match for your counselor course name
-  COUNSELOR_EXACT: [/^MHS Counselors$/i],
-
-  // Keep Class of 2026 broad unless you tell me the exact name
-  CLASS_2026: [/class/i, /2026/i]
+  COUNSELOR: [/counselor/i, /mhs/i],
+  CLASS_2026: [/(class|senior).*(2026|26)/i]
 };
 
-// Scholarship-ish keywords (expand whenever)
 const SCHOLAR_KEYWORDS = [
   "scholarship", "award", "grant", "fellowship",
   "financial", "money", "tuition", "apply", "application",
   "deadline", "due", "senior", "class of", "$", "dollars",
   "local scholarship", "foundation", "community scholarship",
-  "FAFSA", "TASFA"
+  "fafsa", "tasfa"
 ];
 
-// How “hard” to scan each course
 const SCAN_PROFILE = {
   COUNSELOR: {
     announcementsLookbackDays: 120,
     modulesLookbackDays: 365,
-    maxModuleItems: 250   // high
+    maxModuleItems: 250
   },
   CLASS_2026: {
     announcementsLookbackDays: 45,
     modulesLookbackDays: 120,
-    maxModuleItems: 60    // light
+    maxModuleItems: 60
   }
 };
 
-/***************
- * ENTRY POINT
- ***************/
+/**
+ * Entry point (menu item calls this)
+ */
 function scanCanvasForScholarships() {
+  const ss = SpreadsheetApp.getActive();
   const props = PropertiesService.getScriptProperties();
+
+  // 5-minute cooldown
   const last = Number(props.getProperty("canvas:lastScanMs") || "0");
   const now = Date.now();
-
-  // 5 minute cooldown
   if (now - last < 5 * 60 * 1000) {
-    SpreadsheetApp.getActive().toast("Canvas scan blocked (cooldown 5 min).", "Autoship", 5);
+    ss.toast("Canvas scan blocked (cooldown 5 min).", "Autoship", 5);
     return;
   }
   props.setProperty("canvas:lastScanMs", String(now));
 
+  ensureCanvasIntakeSheet_();
+  const intake = ss.getSheetByName(CANVAS_INTAKE_SHEET);
+  if (!intake) throw new Error(`Missing sheet: "${CANVAS_INTAKE_SHEET}"`);
+
+  const seen = loadSeenKeys_(); // contains "key:<...>" and "fp:<...>"
+
+  // Only scan the IDs you explicitly set
   const courses = canvasListActiveCourses_();
 
-  const counselorCourses = pickCourses_(courses, COURSE_MATCH.COUNSELOR_EXACT);
-  const class2026Courses = pickCourses_(courses, COURSE_MATCH.CLASS_2026);
-
   const targets = [];
-  counselorCourses.forEach(c => targets.push({ course: c, profile: "COUNSELOR" }));
-  class2026Courses.forEach(c => targets.push({ course: c, profile: "CLASS_2026" }));
+  courses.forEach(c => {
+    if (TARGET_COURSE_IDS.COUNSELOR.includes(c.id)) targets.push({ course: c, profile: "COUNSELOR" });
+    if (TARGET_COURSE_IDS.CLASS_2026.includes(c.id)) targets.push({ course: c, profile: "CLASS_2026" });
+  });
 
-  if (!targets.length) {
-    throw new Error("No matching Canvas courses found. Rename match patterns in COURSE_MATCH.");
-  }
-
-  ensureCanvasIntakeSheet_();
-
-  const seen = loadSeenKeys_();
+  // prioritize counselor scan
   targets.sort((a, b) => (a.profile === "COUNSELOR" ? -1 : 1));
 
   const rowsToAppend = [];
@@ -398,67 +501,90 @@ function scanCanvasForScholarships() {
   targets.forEach(t => {
     const { course, profile } = t;
     const cfg = SCAN_PROFILE[profile];
+    if (!cfg) return;
 
-    // Announcements (always)
+    // --- Announcements ---
     const ann = canvasFetchAnnouncements_(course.id, cfg.announcementsLookbackDays);
+
     ann.forEach(a => {
+      const plain = stripHtml_(a.message || "");
       const hit = scholarshipHit_(a.title, a.message);
       if (!hit) return;
 
       const key = `announcement:${a.id}`;
-      if (seen.has(key)) return;
-      seen.add(key);
+      const fp = canvasFingerprint_(a.title || "", plain, a.html_url || "");
+
+      if (seen.has("key:" + key) || seen.has("fp:" + fp)) return;
+
+      // Eligibility gate
+      const gate = eligibilityGate_((a.title || "") + "\n" + plain, APPLICANT_PROFILE);
+      if (!gate.eligible) return;
+
+      seen.add("key:" + key);
+      seen.add("fp:" + fp);
 
       rowsToAppend.push(canvasRow_({
         key,
+        fingerprint: fp,
         profile,
         course,
         type: "Announcement",
-        title: a.title,
-        body: stripHtml_(a.message),
-        postedAt: a.posted_at,
+        title: a.title || "",
+        body: plain,
+        postedAt: a.posted_at || "",
         url: a.html_url || "",
         hit
       }));
     });
 
-    // Modules (weekly)
-    const doModules = (new Date().getDay() === 0); // Sunday only
-    if (doModules) {
-      const modItems = canvasFetchModuleItems_(course.id, cfg.modulesLookbackDays, cfg.maxModuleItems);
+    // --- Modules (Sunday only) ---
+    const doModules = (new Date().getDay() === 0);
+    if (!doModules) return;
 
-      modItems.forEach(mi => {
-        // Cheap first pass: title-only filter
-        const hitTitleOnly = scholarshipHit_(mi.title, "");
-        if (!hitTitleOnly) return;
+    const modItems = canvasFetchModuleItems_(course.id, cfg.modulesLookbackDays, cfg.maxModuleItems);
 
-        const deep = canvasDeepFetchTextForModuleItem_(course.id, mi);
-        const hit = scholarshipHit_(deep.title, deep.body);
-        if (!hit) return;
+    modItems.forEach(mi => {
+      // Cheap filter
+      const hitTitleOnly = scholarshipHit_(mi.title || "", "");
+      if (!hitTitleOnly) return;
 
-        const key = `module_item:${mi.id}`;
-        if (seen.has(key)) return;
-        seen.add(key);
+      const deep = canvasDeepFetchTextForModuleItem_(course.id, mi);
+      const hit = scholarshipHit_(deep.title, deep.body);
+      if (!hit) return;
 
-        rowsToAppend.push(canvasRow_({
-          key,
-          profile,
-          course,
-          type: `Module Item (${mi.type || "unknown"})`,
-          title: deep.title,
-          body: deep.body,
-          postedAt: mi.updated_at || mi.published_at || "",
-          url: deep.url,
-          hit
-        }));
-      });
-    }
-  }); // end targets.forEach
+      const key = `module_item:${mi.id}`;
+      const fp = canvasFingerprint_(deep.title || "", deep.body || "", deep.url || "");
+
+      if (seen.has("key:" + key) || seen.has("fp:" + fp)) return;
+
+      const gate = eligibilityGate_((deep.title || "") + "\n" + (deep.body || ""), APPLICANT_PROFILE);
+      if (!gate.eligible) return;
+
+      seen.add("key:" + key);
+      seen.add("fp:" + fp);
+
+      rowsToAppend.push(canvasRow_({
+        key,
+        fingerprint: fp,
+        profile,
+        course,
+        type: `Module Item (${mi.type || "unknown"})`,
+        title: deep.title || "",
+        body: deep.body || "",
+        postedAt: mi.updated_at || mi.published_at || "",
+        url: deep.url || "",
+        hit
+      }));
+    });
+  });
 
   if (rowsToAppend.length) {
     appendCanvasRows_(rowsToAppend);
+    ss.toast(`Canvas scan: added ${rowsToAppend.length} hit(s).`, "Autoship", 6);
+  } else {
+    ss.toast("Canvas scan: no new hits.", "Autoship", 5);
   }
-} // end scanCanvasForScholarships
+}
 
 /***********************
  * CANVAS API HELPERS
@@ -469,9 +595,7 @@ function canvasBaseUrl_() {
 
   const base = v.replace(/\/+$/, "");
   if (/canvas\.arlingtonisd\.org$/i.test(base)) {
-    throw new Error(
-      "Wrong CANVAS_BASE_URL. Use https://arlington.instructure.com (canvas.arlingtonisd.org returns 404 for API)."
-    );
+    throw new Error("Wrong CANVAS_BASE_URL. Use https://arlington.instructure.com");
   }
   return base;
 }
@@ -482,44 +606,57 @@ function canvasToken_() {
   return v.trim();
 }
 
-function canvasFetchJson_(url) {
-  try {
-    const res = UrlFetchApp.fetch(url, {
-      headers: canvasAuthHeaders_(),
-      muteHttpExceptions: true,
-      followRedirects: true
-    });
+// Handles arrays like {"fields[]": ["id","name"]}
+function buildUrl_(base, params) {
+  const parts = [];
+  Object.keys(params || {}).forEach(k => {
+    const v = params[k];
+    if (v === null || v === undefined || v === "") return;
 
-    const code = res.getResponseCode();
-    if (code < 200 || code >= 300) {
-      throw new Error(`Canvas HTTP ${code}: ${res.getContentText().slice(0, 300)}`);
+    if (Array.isArray(v)) {
+      v.forEach(item => parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(item))));
+    } else {
+      parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v)));
     }
-    return JSON.parse(res.getContentText() || "null");
-  } catch (e) {
-    const msg = String(e && e.message ? e.message : e);
-    if (/Bandwidth quota exceeded/i.test(msg)) {
-      // ✅ stop hard + tell you what to do
-      throw new Error("Apps Script UrlFetch bandwidth quota exceeded. Use cached courses + reduce include[]=term + avoid repeated scans.");
-    }
-    throw e;
+  });
+  return parts.length ? `${base}?${parts.join("&")}` : base;
+}
+
+function canvasFetchJson_(path, params) {
+  const base = canvasBaseUrl_();
+  const url = buildUrl_(base + path, params || {});
+  Logger.log("Canvas URL: " + url);
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "get",
+    muteHttpExceptions: true,
+    headers: { Authorization: "Bearer " + canvasToken_() }
+  });
+
+  const code = res.getResponseCode();
+  const text = res.getContentText() || "";
+
+  if (code < 200 || code >= 300) {
+    throw new Error(`Canvas HTTP ${code}: ${text.slice(0, 300)}`);
   }
+  return JSON.parse(text || "null");
 }
 
 function canvasListActiveCourses_() {
-  const cached = cacheGetJson_(CANVAS_COURSES_CACHE_KEY);
-  if (cached && Array.isArray(cached) && cached.length) {
-    Logger.log(`Canvas courses: using cache (${cached.length})`);
-    return cached;
-  }
+  const out = [];
 
-  const url = CANVAS_BASE + "/api/v1/courses?per_page=60"
-    + "&fields[]=id&fields[]=name&fields[]=course_code&fields[]=workflow_state&fields[]=access_restricted_by_date";
+  TARGET_CANVAS_COURSE_IDS.forEach(id => {
+    try {
+      const c = canvasFetchJson_(`/api/v1/courses/${id}`, {
+        "fields[]": ["id", "name", "course_code"]
+      });
+      if (c && c.id) out.push(c);
+    } catch (e) {
+      Logger.log(`Could not fetch course ${id}: ${e && e.message ? e.message : e}`);
+    }
+  });
 
-  const courses = canvasFetchPaged_(url);
-
-  cacheSetJson_(CANVAS_COURSES_CACHE_KEY, courses, CANVAS_CACHE_TTL_SECONDS);
-  Logger.log(`Canvas courses: fetched+cached (${courses.length})`);
-  return courses;
+  return out;
 }
 
 function canvasFetchAnnouncements_(courseId, lookbackDays) {
@@ -529,6 +666,7 @@ function canvasFetchAnnouncements_(courseId, lookbackDays) {
     start_date: start,
     per_page: 100
   });
+
   return (data || []).map(a => ({
     id: a.id,
     title: a.title || "(no title)",
@@ -541,8 +679,8 @@ function canvasFetchAnnouncements_(courseId, lookbackDays) {
 function canvasFetchModuleItems_(courseId, lookbackDays, maxItems) {
   const cutoff = Date.now() - lookbackDays * 24 * 3600 * 1000;
 
-  const ITEMS_PER_PAGE = 30;        // lower payload per call
-  const MAX_MODULES_PER_RUN = 4;    // prevent bandwidth bursts
+  const ITEMS_PER_PAGE = 30;
+  const MAX_MODULES_PER_RUN = 4;
 
   const modules = canvasFetchJson_(`/api/v1/courses/${courseId}/modules`, {
     per_page: ITEMS_PER_PAGE
@@ -559,7 +697,7 @@ function canvasFetchModuleItems_(courseId, lookbackDays, maxItems) {
       per_page: ITEMS_PER_PAGE
     }) || [];
 
-    Utilities.sleep(250); // reduce burst
+    Utilities.sleep(250);
 
     for (let j = 0; j < items.length; j++) {
       if (out.length >= maxItems) break;
@@ -592,7 +730,6 @@ function scholarshipHit_(title, body) {
   const t = (title || "").toLowerCase();
   const b = (body || "").toLowerCase();
 
-  // strong signals
   for (const k of SCHOLAR_KEYWORDS) {
     if (k === "$") {
       if (t.includes("$") || b.includes("$")) return "contains:$";
@@ -601,7 +738,6 @@ function scholarshipHit_(title, body) {
     if (t.includes(k) || b.includes(k)) return `contains:${k}`;
   }
 
-  // quick extra pattern: “due DATE”
   if (/\bdue\b/.test(t + " " + b) && /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/.test(t + " " + b)) {
     return "pattern:due+month";
   }
@@ -614,9 +750,9 @@ function canvasRow_({ key, fingerprint, profile, course, type, title, body, post
     new Date(),
     key,
     fingerprint || "",
-    profile,
-    course.name,
-    type,
+    profile || "",
+    (course && course.name) ? course.name : "",
+    type || "",
     title || "",
     postedAt || "",
     url || "",
@@ -631,20 +767,19 @@ function ensureCanvasIntakeSheet_() {
   if (!sh) sh = ss.insertSheet(CANVAS_INTAKE_SHEET);
 
   if (sh.getLastRow() === 0) {
-      sh.appendRow([
-    "Imported At",
-    "Unique Key",
-    "Fingerprint",
-    "Profile",
-    "Course",
-    "Type",
-    "Title",
-    "Posted/Updated At",
-    "URL",
-    "Hit",
-    "Snippet/Body"
-  ]);
-
+    sh.appendRow([
+      "Imported At",
+      "Unique Key",
+      "Fingerprint",
+      "Profile",
+      "Course",
+      "Type",
+      "Title",
+      "Posted/Updated At",
+      "URL",
+      "Hit",
+      "Snippet/Body"
+    ]);
     sh.setFrozenRows(1);
   }
 }
@@ -663,25 +798,32 @@ function loadSeenKeys_() {
   if (!sh || sh.getLastRow() < 2) return seen;
 
   const lastRow = sh.getLastRow();
+  const vals = sh.getRange(2, 2, lastRow - 1, 2).getValues(); // Unique Key + Fingerprint
 
-  // Unique Key is col 2, Fingerprint is col 3
-  const keys = sh.getRange(2, 2, lastRow - 1, 2).getValues(); // cols 2-3
-  keys.forEach(r => {
+  vals.forEach(r => {
     const k = String(r[0] || "").trim();
     const f = String(r[1] || "").trim();
     if (k) seen.add("key:" + k);
     if (f) seen.add("fp:" + f);
   });
+
   return seen;
 }
 
 /***********************
  * UTIL
  ***********************/
-function pickCourses_(courses, regexList) {
+function pickCoursesAll_(courses, regexList) {
   return (courses || []).filter(c => {
-    const name = (c.name || "").toString();
+    const name = String(c.name || "");
     return regexList.every(rx => rx.test(name));
+  });
+}
+
+function pickCoursesAny_(courses, regexList) {
+  return (courses || []).filter(c => {
+    const name = String(c.name || "");
+    return regexList.some(rx => rx.test(name));
   });
 }
 
@@ -2139,13 +2281,6 @@ function refreshTriageForMainMenu() {
  * MAIN MENU → GOOGLE CALENDAR
  ***********************/
 
-// Calendar columns / properties
-const CAL_EVENT_COL_NAME = "Calendar Event Id";
-const DEFAULT_CAL_ID_PROP = "SCHOLARSHIP_CALENDAR_ID";
-
-// Which edits should trigger an auto-sync of that one row
-const CAL_WATCH_HEADERS = ["Due Date", "Triage", "Status", "Scholarship Name", "Application Portal", "Notes"];
-
 /**
  * Installable trigger (required to call CalendarApp reliably)
  * Run ONCE manually from Apps Script.
@@ -2599,24 +2734,6 @@ function debugHeaders() {
   logHeaders_();
 }
 
-const DIFFICULTY_OPTIONS = ["Easy", "Medium", "Hard", "Fuck it", "No Idea..."];
-const TRIAGE_OPTIONS = ["Immediate", "Urgent", "Non-Urgent", "Satisfied", "Cooked"];
-const STATUS_OPTIONS = ["Not started", "Scanned", "Prepped", "In Progress", "Completed", "Surrendered"];
-const COL_THEME = "Theme";
-
-// Dropdown options (keep EXACT spelling to match your sheet)
-const THEME_OPTIONS = [
-  "Biomed.", "Comp Sci.", "Business/Entrepreneurship", "Pol. Sci.", "Herritage",
-  "Engineering", "Math/Sci", "First Gen", "Broke", "English/Humanities",
-  "Leadership/Service", "None", "Other"
-];
-
-const REQUIREMENT_OPTIONS = [
-  "Essay(s)", "Rec. Letter(s)", "App./ECs)", "Academics/Transcript",
-  "Field of Study", "Exam(s)", "Interview(s)", "Broke/Finances",
-  "Video/Recording", "Other"
-];
-
 // --- normalize + clamp ---
 function norm_(s) {
   return (s ?? "").toString().trim().toLowerCase().replace(/\u00A0/g, " ").replace(/\s+/g, " ");
@@ -2639,49 +2756,75 @@ function clampToOptions_(raw, options, fallback) {
 
 function buildExistingScholarshipKeySet_() {
   const ss = SpreadsheetApp.getActive();
+  const set = new Set();
 
-  const sheets = [MAIN_SHEET, RESULTS_SHEET, SURRENDERED_SHEET]
-    .map(n => ss.getSheetByName(n))
-    .filter(Boolean);
+  const sheets = [MAIN_SHEET, RESULTS_SHEET, "Surrendered"];
 
-  const existing = new Set();
+  sheets.forEach(name => {
+    const sh = ss.getSheetByName(name);
+    if (!sh) return;
 
-  sheets.forEach(sh => {
-    const lastRow = sh.getLastRow();
     const lastCol = sh.getLastColumn();
+    const lastRow = sh.getLastRow();
     if (lastRow < 2) return;
 
-    const headers = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
+    const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0];
     const h = buildHeaderIndex(headers);
 
-    const idxName = optionalIndex_(h, "Scholarship Name");
-    const idxPortal = optionalIndex_(h, "Application Portal");
+    const idxName = h["Scholarship Name"];
+    const idxPortal = h["Application Portal"];
 
-    const values = sh.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, lastCol).getValues();
+    if (idxName != null) {
+      const names = sh.getRange(2, idxName + 1, lastRow - 1, 1).getValues();
+      names.forEach(r => {
+        const v = String(r[0] || "").trim().toLowerCase();
+        if (v) set.add("name:" + v);
+      });
+    }
 
-    values.forEach(r => {
-      const name = idxName !== null ? String(r[idxName] || "").trim() : "";
-      const portal = idxPortal !== null ? String(r[idxPortal] || "").trim() : "";
-
-      if (portal) existing.add("portal:" + canonicalizeUrl_(portal));
-      if (name) existing.add("name:" + normalize_(name));
-    });
+    if (idxPortal != null) {
+      const portals = sh.getRange(2, idxPortal + 1, lastRow - 1, 1).getValues();
+      portals.forEach(r => {
+        const v = String(r[0] || "").trim();
+        if (v) set.add("portal:" + v);
+      });
+    }
   });
 
-  return existing;
+  return set;
 }
 
 function canvasFingerprint_(title, body, url) {
-  const link = canonicalizeUrl_(extractFirstUrl_(body) || url || "");
-  const t = normalize_(title || "");
-  const core = link ? ("link:" + link) : ("title:" + t);
-  return core;
+  const s = normalize_([title, body, url].join(" | ")).slice(0, 2000);
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s);
+  return bytes.map(b => (b < 0 ? b + 256 : b).toString(16).padStart(2, "0")).join("");
 }
 
 function extractFirstUrl_(text) {
   const m = String(text || "").match(/https?:\/\/[^\s)"'>]+/i);
   return m ? m[0] : "";
 }
+
+function debugWriteCanvasIntake_() {
+  const ss = SpreadsheetApp.getActive();
+  const intake = ss.getSheetByName("Canvas Intake");
+  if (!intake) throw new Error('Missing sheet: "Canvas Intake"');
+
+  intake.appendRow([
+    new Date(),
+    "debug:key",
+    "debug profile",
+    "debug course",
+    "Announcement",
+    "Debug intake write works",
+    new Date().toISOString(),
+    "https://example.com",
+    "debug body"
+  ]);
+
+  Logger.log("✅ Debug row appended to Canvas Intake.");
+}
+
 
 function canonicalizeUrl_(u) {
   if (!u) return "";
@@ -3021,6 +3164,49 @@ function cacheGetJson_(key) {
   return str ? JSON.parse(str) : null;
 }
 
+function extractIncomeCap_(t) {
+  // matches: "income under $80,000" / "household income less than 100000"
+  const m = t.match(/\b(household|family)?\s*income\s*(under|less than|below|<=?)\s*\$?\s*([\d,]{4,})\b/i);
+  if (!m) return null;
+  const n = Number(String(m[3]).replace(/,/g, ""));
+  return isNaN(n) ? null : n;
+}
+
+function extractSaiCap_(t) {
+  // matches: "SAI under 15000" / "Student Aid Index <= 20000"
+  const m = t.match(/\b(sai|student aid index)\s*(under|less than|below|<=?)\s*([\d,]{3,})\b/i);
+  if (!m) return null;
+  const n = Number(String(m[3]).replace(/,/g, ""));
+  return isNaN(n) ? null : n;
+}
+
+function extractAnyDate_(t) {
+  // Conservative: looks for YYYY-MM-DD or MM/DD/YYYY or "Mar 1, 2026"
+  // Returns Date or null.
+  let m = t.match(/\b(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})\b/);
+  if (m) {
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  m = t.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/);
+  if (m) {
+    let y = Number(m[3]);
+    if (y < 100) y += 2000;
+    const d = new Date(y, Number(m[1]) - 1, Number(m[2]));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  m = t.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{1,2})(,)?\s+(20\d{2})\b/i);
+  if (m) {
+    const monthMap = {jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,sept:8,oct:9,nov:10,dec:11};
+    const mm = monthMap[m[1].toLowerCase()];
+    const d = new Date(Number(m[4]), mm, Number(m[2]));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  return null;
+}
 
 function installDailyTriageRefreshTrigger() {
   // runs around 6am in your spreadsheet’s timezone
@@ -3041,6 +3227,13 @@ function findColByNorm_(headerRow, targetNorm) {
     if (normalize_(String(headerRow[c] ?? "")) === t) return c;
   }
   return null;
+}
+
+function debugCanvasCourseNames() {
+  const url = CANVAS_BASE + "/api/v1/courses?per_page=100&fields[]=id&fields[]=name";
+  const courses = canvasFetchJson_(url) || [];
+  Logger.log("Course count: " + courses.length);
+  courses.forEach(c => Logger.log(`${c.id} | ${c.name}`));
 }
 
 function safeGetEventById_(cal, eventId) {
