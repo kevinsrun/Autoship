@@ -1,67 +1,19 @@
+// PUSH TEST: 2026-02-07 11:xxclasp status
+
+// @ts-nocheck
+/*************************************************
+ * GLOBAL CONFIG
+ *************************************************/
+ // ===== GLOBAL CONSTANTS (LOAD FIRST) =====
 const MAIN_SHEET = "Main Menu";
 const RESULTS_SHEET = "Results";
-const SURRENDERED_SHEET = "Surrendered";
 const HEADER_ROW = 1;
 
-// Canvas config
-const CANVAS_COURSES_CACHE_KEY = "CANVAS_ACTIVE_COURSES_v1";
-const CANVAS_COURSES_CACHE_SECONDS = 6 * 60 * 60; // 6 hours
-const CANVAS_MAX_COURSES_PER_RUN = 40;            // hard cap
-const CANVAS_SLEEP_MS = 350;
+function testToast_() {
+  SpreadsheetApp.getActive().toast("Autoship is LIVE", "OK", 3);
+}
 
-// Force/target courses
-const FORCE_CANVAS_COURSE_IDS = [302960];
-
-const TARGET_CANVAS_COURSE_IDS = [
-  138471, // MHS Counselors
-  239025  // Class of 2026
-];
-
-const TARGET_COURSE_IDS = {
-  COUNSELOR: [138471],
-  CLASS_2026: [239025]
-};
-
-// ===== ELIGIBILITY PROFILE (Kevin) =====
-const USER_PROFILE = {
-  grade_level: "Senior",
-  hs_class_year: 2026,
-  age: 18,
-  state: "TX",
-  city: "Arlington",
-  gender: "Male",
-  ethnicity: "asian",
-  intended_majors: ["biochem", "biochemistry", "biomedical engineering", "bme", "bioengineering"],
-  gpa_unweighted: 3.98,
-  gpa_weighted: 4.78,
-  family_income: 133000,
-  sai: 20000,
-
-  // "within 10000 is fine" rule for income + SAI cutoffs
-  tolerance_income: 10000,
-  tolerance_sai: 10000
-};
-
-// ✅ IMPORTANT: your code references APPLICANT_PROFILE in multiple places
-const APPLICANT_PROFILE = {
-  gradeLevel: USER_PROFILE.grade_level,
-  hsClassYear: USER_PROFILE.hs_class_year,
-  age: USER_PROFILE.age,
-  state: USER_PROFILE.state,
-  city: USER_PROFILE.city,
-  gender: USER_PROFILE.gender,
-  ethnicity: USER_PROFILE.ethnicity,
-  intendedMajors: USER_PROFILE.intended_majors,
-  gpaUnweighted: USER_PROFILE.gpa_unweighted,
-  gpaWeighted: USER_PROFILE.gpa_weighted,
-  familyIncome: USER_PROFILE.family_income,
-  sai: USER_PROFILE.sai,
-  incomeTolerance: USER_PROFILE.tolerance_income,
-  saiTolerance: USER_PROFILE.tolerance_sai
-};
-
-// Gemini
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-2.5-flash"; // model string you chose
 
 // Your Requirements multi-select token that indicates writing
 const ESSAY_REQUIREMENT_TOKEN = "Essay(s)";
@@ -71,50 +23,19 @@ const COL_APPLICATION_PORTAL = "Application Portal";
 const COL_REQUIREMENTS = "Requirements";
 const COL_APPLICATION_FILE = "Application File";
 const COL_ADDITIONAL_APPLICATION_FILE = "Additional Application Essay File";
-const COL_THEME = "Theme"; // ✅ must be defined BEFORE any usage
 
-// If Gemini detects PDF upload requirement
+// If Gemini detects PDF upload requirement, we generate a PDF and put it in Additional Application File
 const PDF_REQUIRED_KEYWORDS = ["pdf", "upload a pdf", "submit a pdf", "pdf format"];
 
 // Performance tuning
-const MAX_HTML_CHARS = 12000;
+const MAX_HTML_CHARS = 12000; // reduce for speed
 
 // Reminder schedule (days before due date)
-const SCHOLARSHIP_REMINDER_DAYS = [7, 3, 1];
+const SCHOLARSHIP_REMINDER_DAYS = [7, 3, 1]; // change if you want 14,10,5,3,1 etc.
 
-// Status words that should REMOVE the calendar event
+// Status words that should REMOVE the event
 const REMOVE_EVENT_TRIAGE_VALUES = ["surrendered"];
 const REMOVE_EVENT_STATUS_VALUES = ["submitted", "complete", "completed", "won", "not applying"];
-
-// Calendar columns / properties
-const CAL_EVENT_COL_NAME = "Calendar Event Id";
-const DEFAULT_CAL_ID_PROP = "SCHOLARSHIP_CALENDAR_ID";
-const CAL_WATCH_HEADERS = ["Due Date", "Triage", "Status", "Scholarship Name", "Application Portal", "Notes"];
-
-// Dropdown options (keep EXACT spelling to match your sheet)
-const DIFFICULTY_OPTIONS = ["Easy", "Medium", "Hard", "Fuck it", "No Idea..."];
-const TRIAGE_OPTIONS = ["Immediate", "Urgent", "Non-Urgent", "Satisfied", "Cooked"];
-const STATUS_OPTIONS = ["Not started", "Scanned", "Prepped", "In Progress", "Completed", "Surrendered"];
-
-const THEME_OPTIONS = [
-  "Biomed.", "Comp Sci.", "Business/Entrepreneurship", "Pol. Sci.", "Herritage",
-  "Engineering", "Math/Sci", "First Gen", "Broke", "English/Humanities",
-  "Leadership/Service", "None", "Other"
-];
-
-const REQUIREMENT_OPTIONS = [
-  "Essay(s)", "Rec. Letter(s)", "App./ECs", "Academics/Transcript",
-  "Field of Study", "Exam(s)", "Interview(s)", "Broke/Finances",
-  "Video/Recording", "Other"
-];
-
-/*************************************************
- * QUICK TOAST / DEBUG
- *************************************************/
-function testToast_() {
-  SpreadsheetApp.getActive().toast("Autoship is LIVE", "OK", 3);
-}
-
 /*************************************************
  * MENU
  *************************************************/
@@ -148,352 +69,278 @@ function openAddSidebar() {
   SpreadsheetApp.getUi().showSidebar(html);
 }
 
-/*************************************************
- * CORE HELPERS (USED ABOVE/BELOW)
- *************************************************/
-function buildHeaderIndex(headerRow) {
-  const m = {};
-  for (let i = 0; i < headerRow.length; i++) {
-    const key = (headerRow[i] || "").toString().trim();
-    if (key) m[key] = i;
-  }
-  return m;
-}
+function aiAddScholarship(payload) {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
 
-function mustIndex(map, name) {
-  if (!(name in map)) throw new Error(`Missing column header: "${name}"`);
-  return map[name];
-}
+  try {
+    payload = payload || {};
+    const url = (payload.url || "").toString().trim();
+    const pastedText = (payload.pastedText || "").toString();
+    const extraNotes = (payload.extraNotes || "").toString();
 
-function optionalIndex_(map, name) {
-  return (name in map) ? map[name] : null;
-}
-
-function looksLikeUrl_(s) {
-  return /^https?:\/\/\S+$/i.test(String(s || ""));
-}
-
-function normalize_(s) {
-  return (s ?? "")
-    .toString()
-    .replace(/\u00A0/g, " ")
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function norm_(s) {
-  return (s ?? "").toString().trim().toLowerCase().replace(/\u00A0/g, " ").replace(/\s+/g, " ");
-}
-
-function uniq_(arr) {
-  const seen = new Set();
-  const out = [];
-  for (const x of (arr || [])) {
-    const k = norm_(x);
-    if (!k || seen.has(k)) continue;
-    seen.add(k);
-    out.push(x);
-  }
-  return out;
-}
-
-function joinMultiSelect_(items) {
-  return uniq_(items).join(", ");
-}
-
-function clampToOptions_(raw, options, fallback) {
-  const r = norm_(raw);
-  if (!r) return fallback;
-
-  for (const o of options) if (norm_(o) === r) return o;
-  for (const o of options) {
-    const no = norm_(o);
-    if (no.includes(r) || r.includes(no)) return o;
-  }
-  return fallback;
-}
-
-function parseDate_(s) {
-  if (!s) return null;
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-function stripHtml_(html) {
-  if (!html) return "";
-  return String(html)
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function extractDriveIdFromUrl_(url) {
-  if (!url) return "";
-  const m = String(url).match(/\/d\/([a-zA-Z0-9_-]+)/);
-  return m ? m[1] : "";
-}
-
-/*************************************************
- * TRIAGE HELPERS
- *************************************************/
-function parseSheetDate_(v) {
-  if (!v) return null;
-  if (v instanceof Date && !isNaN(v.getTime())) return v;
-
-  const s = String(v).trim();
-  const d = new Date(s);
-  if (!isNaN(d.getTime())) return d;
-
-  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-  if (m) {
-    const mm = Number(m[1]), dd = Number(m[2]), yy = Number(m[3]);
-    const yyyy = yy < 100 ? (2000 + yy) : yy;
-    const d2 = new Date(yyyy, mm - 1, dd);
-    if (!isNaN(d2.getTime())) return d2;
-  }
-  return null;
-}
-
-function daysUntil_(dueDate) {
-  if (!dueDate) return null;
-  const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const startOfDue = new Date(dueDate.getFullYear(), dueDate.getMonth(), dueDate.getDate());
-  const ms = startOfDue.getTime() - startOfToday.getTime();
-  return Math.floor(ms / (24 * 3600 * 1000));
-}
-
-function computeTriage_(dueDate, currentTriage) {
-  const ct = clampToOptions_(currentTriage, TRIAGE_OPTIONS, "");
-  if (ct === "Satisfied" || ct === "Cooked") return ct;
-
-  const d = daysUntil_(dueDate);
-  if (d == null) return "Non-Urgent";
-
-  if (d < 0) return "Cooked";
-  if (d <= 7) return "Immediate";
-  if (d <= 28) return "Urgent";
-  return "Non-Urgent";
-}
-
-function computeStatus_(opts) {
-  const cs = clampToOptions_(opts.currentStatus, STATUS_OPTIONS, "Not started");
-  if (cs === "Completed" || opts.completed) return "Completed";
-  if (cs === "Surrendered" || opts.surrendered) return "Surrendered";
-  if (opts.prepped) return "Prepped";
-  if (opts.scanned) return "Scanned";
-  return "Not started";
-}
-
-function computeDifficulty_(rawDifficulty) {
-  return clampToOptions_(rawDifficulty, DIFFICULTY_OPTIONS, "No Idea...");
-}
-
-/*************************************************
- * ELIGIBILITY (USED BY CANVAS SCAN)
- *************************************************/
-function moneyToNumber_(s) {
-  const raw = String(s || "").toLowerCase().replace(/\$/g, "").replace(/,/g, "").trim();
-  if (!raw) return null;
-  const k = raw.match(/^(\d+(?:\.\d+)?)\s*k$/);
-  if (k) return Math.round(parseFloat(k[1]) * 1000);
-  const n = parseFloat(raw);
-  return isNaN(n) ? null : Math.round(n);
-}
-
-function extractIncomeCap_(t) {
-  const m = String(t || "").match(/\b(household|family)?\s*income\s*(under|less than|below|<=?)\s*\$?\s*([\d,]{4,})\b/i);
-  if (!m) return null;
-  const n = Number(String(m[3]).replace(/,/g, ""));
-  return isNaN(n) ? null : n;
-}
-
-function extractSaiCap_(t) {
-  const m = String(t || "").match(/\b(sai|student aid index)\s*(under|less than|below|<=?)\s*([\d,]{3,})\b/i);
-  if (!m) return null;
-  const n = Number(String(m[3]).replace(/,/g, ""));
-  return isNaN(n) ? null : n;
-}
-
-function extractAnyDate_(t) {
-  const s = String(t || "");
-
-  let m = s.match(/\b(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})\b/);
-  if (m) {
-    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  m = s.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/);
-  if (m) {
-    let y = Number(m[3]);
-    if (y < 100) y += 2000;
-    const d = new Date(y, Number(m[1]) - 1, Number(m[2]));
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  m = s.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{1,2})(,)?\s+(20\d{2})\b/i);
-  if (m) {
-    const monthMap = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,sept:8,oct:9,nov:10,dec:11 };
-    const mm = monthMap[m[1].toLowerCase()];
-    const d = new Date(Number(m[4]), mm, Number(m[2]));
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  return null;
-}
-
-function eligibilityGate_(text, profile) {
-  const t = String(text || "").toLowerCase();
-
-  // deadline passed (very conservative)
-  const dt = extractAnyDate_(t);
-  if (dt && !isNaN(dt.getTime())) {
-    const today = new Date();
-    const startToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-    const startDt = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
-    if (startDt.getTime() < startToday.getTime()) {
-      return { eligible: false, reason: "deadline passed" };
+    if (!url && pastedText.trim().length < 20) {
+      throw new Error("Provide a URL or paste at least ~20 characters of scholarship text.");
     }
-  }
 
-  // Texas resident requirement
-  if (/\b(texas residents?|resident of texas|must be (a )?texas resident)\b/.test(t)) {
-    if (String(profile.state || "").toUpperCase() !== "TX") return { eligible: false, reason: "not Texas resident" };
-  }
+    const ss = SpreadsheetApp.getActive();
+    const sh = ss.getSheetByName(MAIN_SHEET);
+    if (!sh) throw new Error(`Sheet not found: ${MAIN_SHEET}`);
 
-  // Arlington requirement
-  if (/\b(arlington(,)? texas|city of arlington|arlington isd|arlington resident)\b/.test(t)) {
-    if (String(profile.city || "").toLowerCase() !== "arlington") return { eligible: false, reason: "not Arlington" };
-  }
+    const lastCol = sh.getLastColumn();
+    const headers = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
+    const h = buildHeaderIndex(headers);
 
-  // gender requirements
-  if (/\b(male applicants only|men only|for men|must be male)\b/.test(t)) {
-    if (String(profile.gender || "").toLowerCase() !== "male") return { eligible: false, reason: "requires male" };
-  }
-  if (/\b(female applicants only|women only|for women|must be female)\b/.test(t)) {
-    if (String(profile.gender || "").toLowerCase() === "male") return { eligible: false, reason: "requires female" };
-  }
+    // REQUIRED (based on your header row)
+    const idxName = mustIndex(h, "Scholarship Name");
+    const idxPortal = mustIndex(h, "Application Portal");
 
-  // senior requirement
-  if (/\b(high school senior|hs senior|12th grade|grade 12)\b/.test(t)) {
-    if (String(profile.gradeLevel || "").toLowerCase() !== "senior") return { eligible: false, reason: "requires senior" };
-  }
+    // OPTIONAL (based on your header row)
+    const idxDue = optionalIndex_(h, "Due Date");
+    const idxReq = optionalIndex_(h, "Requirements");
+    const idxNotes = optionalIndex_(h, "Notes");
+    const idxTriage = optionalIndex_(h, "Triage");
+    const idxStatus = optionalIndex_(h, "Status");
+    const idxStart = optionalIndex_(h, "Start date");
+    const idxDifficulty = optionalIndex_(h, "Difficulty");
+    const idxTheme = optionalIndex_(h, COL_THEME);
 
-  // age strict
-  if (/\b(must be 18|age 18 required)\b/.test(t)) {
-    if (Number(profile.age) !== 18) return { eligible: false, reason: "requires age 18" };
-  }
+    /// Fast, non-hanging extraction
+const extracted = basicExtractFromText_(pastedText, url);
 
-  // ethnicity strict
-  if (/\b(asian (students|applicants)|aapi (students|applicants))\b/.test(t)) {
-    if (String(profile.ethnicity || "").toLowerCase() !== "asian") return { eligible: false, reason: "requires Asian/AAPI" };
-  }
+// ✅ Create row FIRST
+const row = new Array(lastCol).fill("");
+row[idxName] = extracted.name || "Scholarship";
+row[idxPortal] = url || "";
 
-  // major strict
-  const wantsBiochem = /\b(biochem|biochemistry)\b/.test(t);
-  const wantsBme = /\b(biomedical engineering|biomed eng|bme)\b/.test(t);
-  if (wantsBiochem || wantsBme) {
-    const majors = (profile.intendedMajors || []).map(x => String(x).toLowerCase());
-    if (wantsBiochem && !majors.some(m => m.includes("biochem"))) return { eligible: false, reason: "requires biochem" };
-    if (wantsBme && !majors.some(m => m.includes("biomedical"))) return { eligible: false, reason: "requires BME" };
-  }
-
-  // income cap
-  const incomeCap = extractIncomeCap_(t);
-  if (incomeCap != null) {
-    if (Number(profile.familyIncome) > incomeCap) return { eligible: false, reason: `income>${incomeCap}` };
-  }
-
-  // SAI cap with tolerance
-  const saiCap = extractSaiCap_(t);
-  if (saiCap != null) {
-    const sai = Number(profile.sai);
-    const tol = Number(profile.saiTolerance || 0);
-    if (sai > (saiCap + tol)) return { eligible: false, reason: `sai>${saiCap}+tol` };
-  }
-
-  return { eligible: true, reason: "" };
+// Detect + fill Theme + Requirements (now row exists)
+if (idxTheme !== null) {
+  row[idxTheme] = joinMultiSelect_(detectThemesFromText_(pastedText + "\n" + extraNotes));
 }
 
-/*************************************************
- * FINGERPRINT (USED BY CANVAS DEDUPE)
- *************************************************/
-function canvasFingerprint_(title, body, url) {
-  const s = normalize_([title, body, url].join(" | ")).slice(0, 2000);
-  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s);
-  return bytes.map(b => (b < 0 ? b + 256 : b).toString(16).padStart(2, "0")).join("");
+if (idxReq !== null) {
+  // Merge anything extractor already set + our detector
+  const detectedReq = detectRequirementsFromText_(pastedText + "\n" + extraNotes);
+  const existingReq = (row[idxReq] || "").toString();
+
+  const merged = uniq_(
+    existingReq
+      ? existingReq.split(/[,;\n]+/).map(s => s.trim()).filter(Boolean).concat(detectedReq)
+      : detectedReq
+  );
+  row[idxReq] = joinMultiSelect_(merged);
 }
 
+// Rest of your assignments
+if (idxNotes !== null) row[idxNotes] = [extracted.notes, extraNotes].filter(Boolean).join("\n").trim();
+if (idxReq !== null && extracted.requirements) {
+  const current = (row[idxReq] || "").toString();
+  row[idxReq] = current ? joinMultiSelect_(uniq_(current.split(/[,;\n]+/).map(s=>s.trim()).filter(Boolean)
+    .concat(extracted.requirements.split(/[,;\n]+/).map(s=>s.trim()).filter(Boolean)))) : extracted.requirements;
+}
+
+if (idxDue !== null && extracted.due) row[idxDue] = extracted.due;
+
+    // optional: today
+    if (idxStart !== null) row[idxStart] = new Date();
+
+    // --- DROPDOWNS (deterministic, matches your exact options) ---
+    if (idxDifficulty !== null) {
+      row[idxDifficulty] = computeDifficulty_(extracted.difficulty); // defaults to "No Idea..."
+    }
+
+    if (idxStatus !== null) {
+      // Sidebar add = you/AI scanned requirements
+      row[idxStatus] = computeStatus_({
+        currentStatus: row[idxStatus],
+        scanned: true,
+        prepped: false,
+        completed: false,
+        surrendered: false
+      });
+    }
+
+    if (idxTriage !== null) {
+      const dueDate = (idxDue !== null) ? parseSheetDate_(row[idxDue]) : null;
+      row[idxTriage] = computeTriage_(dueDate, row[idxTriage]); // Immediate/Urgent/Non-Urgent from due date
+    }
+
+    sh.appendRow(row);
+    const addedRow = sh.getLastRow();
+
+    // Make portal clickable
+    if (row[idxPortal] && looksLikeUrl_(row[idxPortal])) {
+      const rt = SpreadsheetApp.newRichTextValue()
+        .setText(row[idxPortal])
+        .setLinkUrl(row[idxPortal])
+        .build();
+      sh.getRange(addedRow, idxPortal + 1).setRichTextValue(rt);
+    }
+
+    return { addedRow };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function detectEssayPrompt_(text) {
+  const t = (text || "").replace(/\u00A0/g, " ").trim();
+  if (t.length < 80) return "";
+
+  // Strong signals
+  const hasEssaySignal = /essay|personal statement|short answer|prompt|respond|write about|topic|question:/i.test(t);
+  if (!hasEssaySignal) return "";
+
+  // Try to pull a “prompt-like” chunk:
+  // 1) If there is a "Prompt:" section
+  const m1 = t.match(/(?:^|\n)\s*(prompt|essay prompt|writing prompt)\s*[:\-]\s*([\s\S]{40,1200})/i);
+  if (m1 && m1[2]) return m1[2].trim();
+
+  // 2) If there is a question mark cluster, take surrounding text
+  const qIdx = t.search(/\?/);
+  if (qIdx !== -1) {
+    const start = Math.max(0, qIdx - 250);
+    const end = Math.min(t.length, qIdx + 900);
+    return t.slice(start, end).trim();
+  }
+
+  // 3) Fallback: first 900 chars if essay signal exists
+  return t.slice(0, 900).trim();
+}
+
+function createEssayDoc_(scholarshipName, sourceUrl, promptText) {
+  const safeName = (scholarshipName || "Scholarship").toString().trim();
+  const docTitle = `${safeName} (Essay Prompt)`;
+
+  const doc = DocumentApp.create(docTitle);
+  const body = doc.getBody();
+  body.clear();
+
+  // Title
+  const pTitle = body.appendParagraph(docTitle);
+  pTitle.setHeading(DocumentApp.ParagraphHeading.TITLE);
+  pTitle.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 30,
+    [DocumentApp.Attribute.BOLD]: true
+  });
+
+  // Heading 1: Source
+  const pH1 = body.appendParagraph("Source");
+  pH1.setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  pH1.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 24,
+    [DocumentApp.Attribute.BOLD]: true
+  });
+
+  // Normal text: URL
+  const pUrl = body.appendParagraph(sourceUrl || "");
+  pUrl.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 12
+  });
+
+  // Heading 1: Prompt
+  const pH2 = body.appendParagraph("Prompt");
+  pH2.setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  pH2.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 24,
+    [DocumentApp.Attribute.BOLD]: true
+  });
+
+  // Normal text: prompt
+  const pPrompt = body.appendParagraph((promptText || "").trim());
+  pPrompt.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 12
+  });
+
+  // Heading 1: Notes
+  const pH3 = body.appendParagraph("Notes");
+  pH3.setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  pH3.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 24,
+    [DocumentApp.Attribute.BOLD]: true
+  });
+
+  // Normal placeholder
+  const pNotes = body.appendParagraph("");
+  pNotes.setAttributes({
+    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
+    [DocumentApp.Attribute.FONT_SIZE]: 12
+  });
+
+  doc.saveAndClose();
+  return doc.getUrl();
+}
 /*******************************
- * CANVAS → AUTOSHIP INTAKE (FIXED)
+ * CANVAS → AUTOSHIP INTAKE
+ * Focus:
+ *  - HEAVY: MHS Counselor (announcements + modules)
+ *  - LIGHT: Class of 2026 (announcements + modules, fewer items)
  *******************************/
 
 const CANVAS_INTAKE_SHEET = "Canvas Intake";
 
-// Course matching (optional — not required if using fixed IDs)
+// Course matching (flexible): edit if your actual course names differ
 const COURSE_MATCH = {
-  COUNSELOR: [/counselor/i, /mhs/i],
-  CLASS_2026: [/(class|senior).*(2026|26)/i]
+  // Exact match for your counselor course name
+  COUNSELOR_EXACT: [/^MHS Counselors$/i],
+
+  // Keep Class of 2026 broad unless you tell me the exact name
+  CLASS_2026: [/class/i, /2026/i]
 };
 
+// Scholarship-ish keywords (expand whenever)
 const SCHOLAR_KEYWORDS = [
   "scholarship", "award", "grant", "fellowship",
   "financial", "money", "tuition", "apply", "application",
   "deadline", "due", "senior", "class of", "$", "dollars",
   "local scholarship", "foundation", "community scholarship",
-  "fafsa", "tasfa"
+  "FAFSA", "TASFA"
 ];
 
+// How “hard” to scan each course
 const SCAN_PROFILE = {
   COUNSELOR: {
     announcementsLookbackDays: 120,
     modulesLookbackDays: 365,
-    maxModuleItems: 250
+    maxModuleItems: 250   // high
   },
   CLASS_2026: {
     announcementsLookbackDays: 45,
     modulesLookbackDays: 120,
-    maxModuleItems: 60
+    maxModuleItems: 60    // light
   }
 };
 
-/**
- * Entry point (menu item calls this)
- */
+/***************
+ * ENTRY POINT
+ ***************/
 function scanCanvasForScholarships() {
-  const ss = SpreadsheetApp.getActive();
-  const props = PropertiesService.getScriptProperties();
-
-  // 5-minute cooldown
-  const last = Number(props.getProperty("canvas:lastScanMs") || "0");
-  const now = Date.now();
-  if (now - last < 5 * 60 * 1000) {
-    ss.toast("Canvas scan blocked (cooldown 5 min).", "Autoship", 5);
-    return;
-  }
-  props.setProperty("canvas:lastScanMs", String(now));
-
-  ensureCanvasIntakeSheet_();
-  const intake = ss.getSheetByName(CANVAS_INTAKE_SHEET);
-  if (!intake) throw new Error(`Missing sheet: "${CANVAS_INTAKE_SHEET}"`);
-
-  const seen = loadSeenKeys_(); // contains "key:<...>" and "fp:<...>"
-
-  // Only scan the IDs you explicitly set
   const courses = canvasListActiveCourses_();
 
-  const targets = [];
-  courses.forEach(c => {
-    if (TARGET_COURSE_IDS.COUNSELOR.includes(c.id)) targets.push({ course: c, profile: "COUNSELOR" });
-    if (TARGET_COURSE_IDS.CLASS_2026.includes(c.id)) targets.push({ course: c, profile: "CLASS_2026" });
-  });
+  const counselorCourses = pickCourses_(courses, COURSE_MATCH.COUNSELOR_EXACT);
+  const class2026Courses = pickCourses_(courses, COURSE_MATCH.CLASS_2026);
 
-  // prioritize counselor scan
+
+  const targets = [];
+  counselorCourses.forEach(c => targets.push({ course: c, profile: "COUNSELOR" }));
+  class2026Courses.forEach(c => targets.push({ course: c, profile: "CLASS_2026" }));
+
+  if (!targets.length) {
+    throw new Error("No matching Canvas courses found. Rename match patterns in COURSE_MATCH.");
+  }
+
+  ensureCanvasIntakeSheet_();
+
+  // Load dedupe set from existing sheet
+  const seen = loadSeenKeys_();
+
+  // Process heavy first
   targets.sort((a, b) => (a.profile === "COUNSELOR" ? -1 : 1));
 
   const rowsToAppend = [];
@@ -501,89 +348,61 @@ function scanCanvasForScholarships() {
   targets.forEach(t => {
     const { course, profile } = t;
     const cfg = SCAN_PROFILE[profile];
-    if (!cfg) return;
 
-    // --- Announcements ---
+    // Announcements (always)
     const ann = canvasFetchAnnouncements_(course.id, cfg.announcementsLookbackDays);
-
     ann.forEach(a => {
-      const plain = stripHtml_(a.message || "");
       const hit = scholarshipHit_(a.title, a.message);
       if (!hit) return;
 
       const key = `announcement:${a.id}`;
-      const fp = canvasFingerprint_(a.title || "", plain, a.html_url || "");
-
-      if (seen.has("key:" + key) || seen.has("fp:" + fp)) return;
-
-      // Eligibility gate
-      const gate = eligibilityGate_((a.title || "") + "\n" + plain, APPLICANT_PROFILE);
-      if (!gate.eligible) return;
-
-      seen.add("key:" + key);
-      seen.add("fp:" + fp);
+      if (seen.has(key)) return;
+      seen.add(key);
 
       rowsToAppend.push(canvasRow_({
         key,
-        fingerprint: fp,
         profile,
         course,
         type: "Announcement",
-        title: a.title || "",
-        body: plain,
-        postedAt: a.posted_at || "",
+        title: a.title,
+        body: stripHtml_(a.message),
+        postedAt: a.posted_at,
         url: a.html_url || "",
         hit
       }));
     });
 
-    // --- Modules (Sunday only) ---
-    const doModules = (new Date().getDay() === 0);
-    if (!doModules) return;
-
+    // Modules + items
     const modItems = canvasFetchModuleItems_(course.id, cfg.modulesLookbackDays, cfg.maxModuleItems);
-
     modItems.forEach(mi => {
-      // Cheap filter
-      const hitTitleOnly = scholarshipHit_(mi.title || "", "");
+      // Cheap first pass: title-only filter to save quota
+      const hitTitleOnly = scholarshipHit_(mi.title, "");
       if (!hitTitleOnly) return;
 
+      // Deep fetch content from Canvas API (page/assignment/discussion/file)
       const deep = canvasDeepFetchTextForModuleItem_(course.id, mi);
+
+      // Real test on fetched body
       const hit = scholarshipHit_(deep.title, deep.body);
       if (!hit) return;
 
       const key = `module_item:${mi.id}`;
-      const fp = canvasFingerprint_(deep.title || "", deep.body || "", deep.url || "");
-
-      if (seen.has("key:" + key) || seen.has("fp:" + fp)) return;
-
-      const gate = eligibilityGate_((deep.title || "") + "\n" + (deep.body || ""), APPLICANT_PROFILE);
-      if (!gate.eligible) return;
-
-      seen.add("key:" + key);
-      seen.add("fp:" + fp);
+      if (seen.has(key)) return;
+      seen.add(key);
 
       rowsToAppend.push(canvasRow_({
         key,
-        fingerprint: fp,
         profile,
         course,
         type: `Module Item (${mi.type || "unknown"})`,
-        title: deep.title || "",
-        body: deep.body || "",
+        title: deep.title,
+        body: deep.body,
         postedAt: mi.updated_at || mi.published_at || "",
-        url: deep.url || "",
+        url: deep.url,
         hit
       }));
     });
-  });
-
-  if (rowsToAppend.length) {
-    appendCanvasRows_(rowsToAppend);
-    ss.toast(`Canvas scan: added ${rowsToAppend.length} hit(s).`, "Autoship", 6);
-  } else {
-    ss.toast("Canvas scan: no new hits.", "Autoship", 5);
-  }
+  }); // <-- Add this closing brace to end targets.forEach
 }
 
 /***********************
@@ -592,71 +411,40 @@ function scanCanvasForScholarships() {
 function canvasBaseUrl_() {
   const v = PropertiesService.getScriptProperties().getProperty("CANVAS_BASE_URL");
   if (!v) throw new Error("Missing Script Property: CANVAS_BASE_URL");
-
-  const base = v.replace(/\/+$/, "");
-  if (/canvas\.arlingtonisd\.org$/i.test(base)) {
-    throw new Error("Wrong CANVAS_BASE_URL. Use https://arlington.instructure.com");
-  }
-  return base;
+  return v.replace(/\/+$/, "");
 }
-
 function canvasToken_() {
   const v = PropertiesService.getScriptProperties().getProperty("CANVAS_TOKEN");
   if (!v) throw new Error("Missing Script Property: CANVAS_TOKEN");
   return v.trim();
 }
 
-// Handles arrays like {"fields[]": ["id","name"]}
-function buildUrl_(base, params) {
-  const parts = [];
-  Object.keys(params || {}).forEach(k => {
-    const v = params[k];
-    if (v === null || v === undefined || v === "") return;
-
-    if (Array.isArray(v)) {
-      v.forEach(item => parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(item))));
-    } else {
-      parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v)));
-    }
-  });
-  return parts.length ? `${base}?${parts.join("&")}` : base;
-}
-
 function canvasFetchJson_(path, params) {
   const base = canvasBaseUrl_();
   const url = buildUrl_(base + path, params || {});
-  Logger.log("Canvas URL: " + url);
-
   const res = UrlFetchApp.fetch(url, {
     method: "get",
     muteHttpExceptions: true,
     headers: { Authorization: "Bearer " + canvasToken_() }
   });
-
   const code = res.getResponseCode();
-  const text = res.getContentText() || "";
-
   if (code < 200 || code >= 300) {
-    throw new Error(`Canvas HTTP ${code}: ${text.slice(0, 300)}`);
+    throw new Error(`Canvas API error ${code}: ${res.getContentText().slice(0, 200)}`);
   }
-  return JSON.parse(text || "null");
+  return JSON.parse(res.getContentText() || "null");
 }
 
 function canvasListActiveCourses_() {
-  const out = [];
-
-  TARGET_CANVAS_COURSE_IDS.forEach(id => {
-    try {
-      const c = canvasFetchJson_(`/api/v1/courses/${id}`, {
-        "fields[]": ["id", "name", "course_code"]
-      });
-      if (c && c.id) out.push(c);
-    } catch (e) {
-      Logger.log(`Could not fetch course ${id}: ${e && e.message ? e.message : e}`);
-    }
+  // enrollment_state=active keeps it clean; per_page helps reduce pagination needs
+  const data = canvasFetchJson_("/api/v1/courses", {
+    enrollment_state: "active",
+    per_page: 100
   });
-
-  return out;
+  // data can include many; keep minimal fields
+  return (data || []).map(c => ({
+    id: c.id,
+    name: c.name || c.course_code || `Course ${c.id}`
+  }));
 }
 
 function canvasFetchAnnouncements_(courseId, lookbackDays) {
@@ -666,7 +454,6 @@ function canvasFetchAnnouncements_(courseId, lookbackDays) {
     start_date: start,
     per_page: 100
   });
-
   return (data || []).map(a => ({
     id: a.id,
     title: a.title || "(no title)",
@@ -679,25 +466,14 @@ function canvasFetchAnnouncements_(courseId, lookbackDays) {
 function canvasFetchModuleItems_(courseId, lookbackDays, maxItems) {
   const cutoff = Date.now() - lookbackDays * 24 * 3600 * 1000;
 
-  const ITEMS_PER_PAGE = 30;
-  const MAX_MODULES_PER_RUN = 4;
-
-  const modules = canvasFetchJson_(`/api/v1/courses/${courseId}/modules`, {
-    per_page: ITEMS_PER_PAGE
-  }) || [];
+  const modules = canvasFetchJson_(`/api/v1/courses/${courseId}/modules`, { per_page: 100 }) || [];
 
   const out = [];
-
-  for (let i = 0; i < modules.length && i < MAX_MODULES_PER_RUN; i++) {
+  for (let i = 0; i < modules.length; i++) {
     if (out.length >= maxItems) break;
 
     const m = modules[i];
-
-    const items = canvasFetchJson_(`/api/v1/courses/${courseId}/modules/${m.id}/items`, {
-      per_page: ITEMS_PER_PAGE
-    }) || [];
-
-    Utilities.sleep(250);
+    const items = canvasFetchJson_(`/api/v1/courses/${courseId}/modules/${m.id}/items`, { per_page: 100 }) || [];
 
     for (let j = 0; j < items.length; j++) {
       if (out.length >= maxItems) break;
@@ -709,9 +485,9 @@ function canvasFetchModuleItems_(courseId, lookbackDays, maxItems) {
       out.push({
         id: it.id,
         title: it.title || "(no title)",
-        type: it.type || "",
-        content_id: it.content_id || null,
-        page_url: it.page_url || "",
+        type: it.type || "",               // <- key for deep fetch
+        content_id: it.content_id || null, // <- key for deep fetch
+        page_url: it.page_url || "",       // <- some items include this
         url: it.url || "",
         html_url: it.html_url || "",
         updated_at: it.updated_at || "",
@@ -719,7 +495,6 @@ function canvasFetchModuleItems_(courseId, lookbackDays, maxItems) {
       });
     }
   }
-
   return out;
 }
 
@@ -730,6 +505,7 @@ function scholarshipHit_(title, body) {
   const t = (title || "").toLowerCase();
   const b = (body || "").toLowerCase();
 
+  // strong signals
   for (const k of SCHOLAR_KEYWORDS) {
     if (k === "$") {
       if (t.includes("$") || b.includes("$")) return "contains:$";
@@ -738,6 +514,7 @@ function scholarshipHit_(title, body) {
     if (t.includes(k) || b.includes(k)) return `contains:${k}`;
   }
 
+  // quick extra pattern: “due DATE”
   if (/\bdue\b/.test(t + " " + b) && /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/.test(t + " " + b)) {
     return "pattern:due+month";
   }
@@ -745,19 +522,18 @@ function scholarshipHit_(title, body) {
   return "";
 }
 
-function canvasRow_({ key, fingerprint, profile, course, type, title, body, postedAt, url, hit }) {
+function canvasRow_({ key, profile, course, type, title, body, postedAt, url, hit }) {
   return [
-    new Date(),
-    key,
-    fingerprint || "",
-    profile || "",
-    (course && course.name) ? course.name : "",
-    type || "",
+    new Date(),            // Imported At
+    key,                   // Unique Key (dedupe)
+    profile,               // COUNSELOR / CLASS_2026
+    course.name,           // Course
+    type,                  // Announcement / Module Item
     title || "",
     postedAt || "",
     url || "",
     hit || "",
-    body || ""
+    body || ""             // Snippet/body
   ];
 }
 
@@ -770,7 +546,6 @@ function ensureCanvasIntakeSheet_() {
     sh.appendRow([
       "Imported At",
       "Unique Key",
-      "Fingerprint",
       "Profile",
       "Course",
       "Type",
@@ -797,33 +572,22 @@ function loadSeenKeys_() {
   const seen = new Set();
   if (!sh || sh.getLastRow() < 2) return seen;
 
-  const lastRow = sh.getLastRow();
-  const vals = sh.getRange(2, 2, lastRow - 1, 2).getValues(); // Unique Key + Fingerprint
-
-  vals.forEach(r => {
-    const k = String(r[0] || "").trim();
-    const f = String(r[1] || "").trim();
-    if (k) seen.add("key:" + k);
-    if (f) seen.add("fp:" + f);
+  // Unique Key is column 2
+  const values = sh.getRange(2, 2, sh.getLastRow() - 1, 1).getValues();
+  values.forEach(r => {
+    const k = (r[0] || "").toString().trim();
+    if (k) seen.add(k);
   });
-
   return seen;
 }
 
 /***********************
  * UTIL
  ***********************/
-function pickCoursesAll_(courses, regexList) {
+function pickCourses_(courses, regexList) {
   return (courses || []).filter(c => {
-    const name = String(c.name || "");
+    const name = (c.name || "").toString();
     return regexList.every(rx => rx.test(name));
-  });
-}
-
-function pickCoursesAny_(courses, regexList) {
-  return (courses || []).filter(c => {
-    const name = String(c.name || "");
-    return regexList.some(rx => rx.test(name));
   });
 }
 
@@ -931,7 +695,7 @@ function pipeCanvasHitsToMainMenu() {
   const mDifficulty = optionalIndex_(mh, "Difficulty");
 
   // Build a quick dedupe set from Main Menu notes + portal
-  const existing = buildExistingScholarshipKeySet_();
+  const existing = new Set();
   const mainLastRow = main.getLastRow();
   if (mainLastRow >= 2) {
     const portalCol = mPortal + 1;
@@ -1025,54 +789,25 @@ function pipeCanvasHitsToMainMenu() {
     existing.add("portal:" + url);
   }
 
-    if (rowsToAppend.length) {
-    const startRow = main.getLastRow() + 1;
-
-    // 1) fast append
-    main.getRange(startRow, 1, rowsToAppend.length, rowsToAppend[0].length)
-      .setValues(rowsToAppend);
-
-    // 2) rebuild RichText for link-sensitive columns (Notes + Portal)
-    for (let i = 0; i < rowsToAppend.length; i++) {
-      const rOut = startRow + i;
-
-      // Portal: make clickable if it’s a URL
-      if (mPortal !== null) {
-        const portal = String(rowsToAppend[i][mPortal] || "").trim();
-        if (portal && /^https?:\/\//i.test(portal)) {
-          const rt = SpreadsheetApp.newRichTextValue()
-            .setText(portal)
-            .setLinkUrl(portal)
-            .build();
-          main.getRange(rOut, mPortal + 1).setRichTextValue(rt);
-        }
-      }
-
-      // Notes: auto-link any raw URLs inside the text
-      if (mNotes !== null) {
-        const notesText = String(rowsToAppend[i][mNotes] || "");
-        const rtNotes = buildRichTextPreservingLinks_(notesText, null);
-        main.getRange(rOut, mNotes + 1).setRichTextValue(rtNotes);
-      }
-    }
+  if (rowsToAppend.length) {
+    main.getRange(main.getLastRow() + 1, 1, rowsToAppend.length, rowsToAppend[0].length).setValues(rowsToAppend);
   }
 
-  // ✅ write back "Piped" status (THIS must be inside the function)
   if (pipedUpdates.length) {
-    const pipedCol = idxPiped + 1; // 1-based
+    // Write back "Piped" status
+    const pipedCol = idxPiped + 1; // 1-based for Range
     const updatesRange = intake.getRange(2, pipedCol, intakeValues.length, 1);
     const colVals = updatesRange.getValues();
 
-    pipedUpdates.forEach(([i, val]) => {
-      colVals[i][0] = val;
-    });
-
+    pipedUpdates.forEach(([i, val]) => colVals[i][0] = val);
     updatesRange.setValues(colVals);
   }
 
-  ss.toast(`Piped ${rowsToAppend.length} Canvas hit(s) into Main Menu.`, "Autoship", 6);
-} // ✅ end pipeCanvasHitsToMainMenu
+  // Optional: refresh triage after adding
+  // refreshTriageForMainMenu();
 
+  ss.toast(`Piped ${rowsToAppend.length} Canvas hit(s) into Main Menu.`, "Autoship", 6);
+}
 
 /**
  * Very fast “good enough” extractor so the sidebar never hangs.
@@ -1381,7 +1116,6 @@ function syncSatisfiedToResults() {
   const mainRange = main.getRange(HEADER_ROW, 1, numRows, lastCol);
 
   const mainValues = mainRange.getValues();
-  const mainDisplay = mainRange.getDisplayValues(); // ✅ dropdown-safe
   const mainRich = mainRange.getRichTextValues();
   const mainFormulas = mainRange.getFormulas();
 
@@ -1411,13 +1145,6 @@ function syncSatisfiedToResults() {
   const rReq = optionalIndex_(rh, COL_REQUIREMENTS);
   const rAppFile = optionalIndex_(rh, COL_APPLICATION_FILE);
   const rAddl = optionalIndex_(rh, COL_ADDITIONAL_APPLICATION_FILE);
-  const idxEvent = optionalIndex_(h, CAL_EVENT_COL_NAME); // may be null
-
-
-    // --- Calendar (optional but recommended) ---
-  const calId = PropertiesService.getScriptProperties()
-    .getProperty(DEFAULT_CAL_ID_PROP) || "primary";
-  const cal = CalendarApp.getCalendarById(calId);
 
   const existing = new Set();
   for (let i = 1; i < resValues.length; i++) {
@@ -1429,121 +1156,88 @@ function syncSatisfiedToResults() {
   const rowsToRemove = [];
   let moved = 0;
 
-  for (let i = 1; i < mainValues.length; i++) {
-    const name = String(mainValues[i][idxName] || "").trim();
-    if (!name) continue;
+ for (let i = 1; i < mainValues.length; i++) {
+  const row = mainValues[i];
+  const name = (row[idxName] || "").toString().trim();
+  if (!name) continue;
 
-    const triageDisp = String(mainDisplay[i][idxTriage] || "");
-    const triageNorm = normalize_(triageDisp);
+  // ✅ Results sync is based on TRIAGE == Satisfied
+  const triageNorm = normalize_((row[idxTriage] ?? "").toString());
+  if (triageNorm !== "satisfied") continue;
 
-    // DEBUG: log first 25 rows
-    if (i <= 25) Logger.log(`Row ${HEADER_ROW + i}: triageDisp="${triageDisp}" triageNorm="${triageNorm}"`);
+  const key = name.toLowerCase();
+  if (existing.has(key)) continue;
 
-    if (triageNorm !== "satisfied") continue;
+  const out = new Array(resValues[0].length).fill("");
 
-    const key = name.toLowerCase();
-    const row = mainValues[i];
+  out[rName] = row[idxName];
+  out[rDue] = row[idxDue];
+  out[rDifficulty] = row[idxDifficulty];
+  out[rNotes] = row[idxNotes];
+  out[rPortal] = row[idxPortal];
 
-    const out = new Array(resValues[0].length).fill("");
+  if (rReq !== null && idxReq !== null) out[rReq] = row[idxReq];
 
-    out[rName] = row[idxName];
-    out[rDue] = row[idxDue];
-    out[rDifficulty] = row[idxDifficulty];
-    out[rNotes] = row[idxNotes];
-    out[rPortal] = row[idxPortal];
+  // --- Application File chips ---
+  if (rAppFile !== null && idxAppFile !== null) {
+    out[rAppFile] = chipFormulaFromCell_(
+      row[idxAppFile],
+      mainRich[i][idxAppFile],
+      mainFormulas[i][idxAppFile]
+    );
+  }
 
-    if (rReq !== null && idxReq !== null) out[rReq] = row[idxReq];
+  if (rAddl !== null && idxAddl !== null) {
+    out[rAddl] = chipFormulaFromCell_(
+      row[idxAddl],
+      mainRich[i][idxAddl],
+      mainFormulas[i][idxAddl]
+    );
+  }
 
-    if (rAppFile !== null && idxAppFile !== null) {
-      out[rAppFile] = chipFormulaFromCell_(
-        row[idxAppFile],
-        mainRich[i][idxAppFile],
-        mainFormulas[i][idxAppFile]
-      );
-    }
+  results.appendRow(out);
+  const appendedRow = results.getLastRow();
 
-    if (rAddl !== null && idxAddl !== null) {
-      out[rAddl] = chipFormulaFromCell_(
-        row[idxAddl],
-        mainRich[i][idxAddl],
-        mainFormulas[i][idxAddl]
-      );
-    }
+  // Preserve rich links in portal/files (if present)
+  enqueuePreservedLinkWrite_({
+    linkWrites,
+    srcValues: row,
+    srcRichRow: mainRich[i],
+    srcFormulaRow: mainFormulas[i],
+    srcIdx: idxPortal,
+    dstRow: appendedRow,
+    dstCol1Based: rPortal + 1
+  });
 
-    results.appendRow(out);
-    const appendedRow = results.getLastRow();
-
-    // ✅ delete calendar event for satisfied rows we’re moving
-    if (idxEvent !== null && cal) {
-      const eventId = String(mainValues[i][idxEvent] || "").trim();
-      if (eventId) {
-        const ev = safeGetEventById_(cal, eventId);
-        if (ev) ev.deleteEvent();
-        // optional: clear it in-memory so when you write main back later it’s blank
-        // mainValues[i][idxEvent] = "";
-      }
-    }
-
+  if (idxAppFile !== null && rAppFile !== null) {
     enqueuePreservedLinkWrite_({
       linkWrites,
       srcValues: row,
       srcRichRow: mainRich[i],
       srcFormulaRow: mainFormulas[i],
-      srcIdx: idxPortal,
+      srcIdx: idxAppFile,
       dstRow: appendedRow,
-      dstCol1Based: rPortal + 1
-    });
-
-
-    if (idxAppFile !== null && rAppFile !== null) {
-      enqueuePreservedLinkWrite_({
-        linkWrites,
-        srcValues: row,
-        srcRichRow: mainRich[i],
-        srcFormulaRow: mainFormulas[i],
-        srcIdx: idxAppFile,
-        dstRow: appendedRow,
-        dstCol1Based: rAppFile + 1
-      });
-    }
-
-    if (idxAddl !== null && rAddl !== null) {
-      enqueuePreservedLinkWrite_({
-        linkWrites,
-        srcValues: row,
-        srcRichRow: mainRich[i],
-        srcFormulaRow: mainFormulas[i],
-        srcIdx: idxAddl,
-        dstRow: appendedRow,
-        dstCol1Based: rAddl + 1
-      });
-    }
-
-    existing.add(key);
-    moved++;
-    rowsToRemove.push(HEADER_ROW + i);
-  }
-
-  // Apply link writes in Results
-  if (linkWrites.length) {
-    linkWrites.forEach(w => {
-      const cell = results.getRange(w.row, w.col);
-      if (w.formula) cell.setFormula(w.formula);
-      else if (w.richText) cell.setRichTextValue(w.richText);
+      dstCol1Based: rAppFile + 1
     });
   }
 
-  // ✅ Delete from Main bottom-up
-  if (rowsToRemove.length) {
-    rowsToRemove.sort((a, b) => b - a);
-    for (const r of rowsToRemove) main.deleteRow(r);
+  if (idxAddl !== null && rAddl !== null) {
+    enqueuePreservedLinkWrite_({
+      linkWrites,
+      srcValues: row,
+      srcRichRow: mainRich[i],
+      srcFormulaRow: mainFormulas[i],
+      srcIdx: idxAddl,
+      dstRow: appendedRow,
+      dstCol1Based: rAddl + 1
+    });
   }
 
-  ss.toast(
-    moved ? `Moved ${moved} satisfied row(s) to Results.` : "No rows with Triage = Satisfied.",
-    "Scholarship Tools",
-    6
-  );
+  existing.add(key);
+  moved++;
+  rowsToRemove.push(HEADER_ROW + i);
+}
+// <-- Add this closing brace to end syncSatisfiedToResults
 }
 
 function syncSurrenderedToSheet() {
@@ -1608,7 +1302,7 @@ function syncSurrenderedToSheet() {
   const todayStr = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd");
 
   for (let i = 1; i < mainValues.length; i++) {
-  //  Surrendered sync is based on STATUS == Surrendered (use display values)
+  // ✅ Surrendered sync is based on STATUS == Surrendered (use display values)
   const statusDisp = String(mainDisplay[i][idxStatus] ?? "").trim();
   const statusNorm = normalize_(statusDisp);
   if (statusNorm !== "surrendered") continue;
@@ -1679,72 +1373,6 @@ function extractEssayPromptFromUrlOrPdf_(url) {
   }
 
   return pack;
-}
-
-function extractLinkRunsFromRichText_(rt) {
-  const out = [];
-  if (!rt) return out;
-
-  const runs = rt.getRuns ? rt.getRuns() : [];
-  runs.forEach(run => {
-    const url = run.getLinkUrl();
-    const txt = run.getText();
-    if (url && txt) out.push({ text: txt, url: url });
-  });
-
-  // whole-cell link fallback
-  try {
-    const whole = rt.getLinkUrl && rt.getLinkUrl();
-    const wholeText = rt.getText && rt.getText();
-    if (whole && wholeText) out.push({ text: wholeText, url: whole });
-  } catch (_) {}
-
-  // de-dupe
-  const seen = new Set();
-  return out.filter(x => {
-    const k = x.url + "||" + x.text;
-    if (seen.has(k)) return false;
-    seen.add(k);
-    return true;
-  });
-}
-
-function buildRichTextPreservingLinks_(newText, oldRichText) {
-  const text = String(newText ?? "");
-  const builder = SpreadsheetApp.newRichTextValue().setText(text);
-
-  const runs = extractLinkRunsFromRichText_(oldRichText);
-
-  // Re-apply old links where the same linked text appears in new text
-  runs.forEach(r => {
-    const needle = String(r.text || "");
-    if (!needle) return;
-
-    let idx = 0;
-    while (idx < text.length) {
-      const at = text.indexOf(needle, idx);
-      if (at === -1) break;
-      builder.setLinkUrl(at, at + needle.length, r.url);
-      idx = at + needle.length;
-    }
-  });
-
-  // Also auto-link any raw URLs that appear in new text
-  const urlRegex = /https?:\/\/[^\s)"'>]+/g;
-  let m;
-  while ((m = urlRegex.exec(text)) !== null) {
-    const u = m[0];
-    builder.setLinkUrl(m.index, m.index + u.length, u);
-  }
-
-  return builder.build();
-}
-
-function setCellTextPreserveLinks_(sheet, row, col, newText) {
-  const cell = sheet.getRange(row, col);
-  const oldRT = cell.getRichTextValue();
-  const rt = buildRichTextPreservingLinks_(newText, oldRT);
-  cell.setRichTextValue(rt);
 }
 
 function fetchHtmlAsText_(url) {
@@ -2281,189 +1909,7 @@ function refreshTriageForMainMenu() {
  * MAIN MENU → GOOGLE CALENDAR
  ***********************/
 
-/**
- * Installable trigger (required to call CalendarApp reliably)
- * Run ONCE manually from Apps Script.
- */
-function installCalendarAutoSyncTrigger() {
-  const ss = SpreadsheetApp.getActive();
-
-  // remove old triggers pointing to this handler to avoid duplicates
-  ScriptApp.getProjectTriggers().forEach(t => {
-    if (t.getHandlerFunction && t.getHandlerFunction() === "calendarAutoSyncOnEdit") {
-      ScriptApp.deleteTrigger(t);
-    }
-  });
-
-  ScriptApp.newTrigger("calendarAutoSyncOnEdit")
-    .forSpreadsheet(ss)
-    .onEdit()
-    .create();
-
-  ss.toast("Installed: Calendar auto-sync on edit ✅", "Autoship", 5);
-}
-
-/**
- * Trigger handler: when you edit Main Menu, auto-sync only that row.
- */
-function calendarAutoSyncOnEdit(e) {
-  try {
-    if (!e || !e.range) return;
-
-    const sh = e.range.getSheet();
-    if (!sh) return;
-
-    // Only react on Main Menu
-    if (sh.getName() !== MAIN_SHEET) return;
-
-    // Ignore header edits
-    const row = e.range.getRow();
-    if (row <= HEADER_ROW) return;
-
-    // Only react if the edited column is one of our watch columns
-    const lastCol = sh.getLastColumn();
-    const headers = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
-    const h = buildHeaderIndex(headers);
-
-    const editedCol = e.range.getColumn(); // 1-based
-    const editedHeader = headers[editedCol - 1] ? String(headers[editedCol - 1]).trim() : "";
-
-    if (editedHeader && !CAL_WATCH_HEADERS.includes(editedHeader)) return;
-
-    // Sync just this one row
-    syncScholarshipCalendarForRow_(sh, row, h);
-  } catch (err) {
-    Logger.log("calendarAutoSyncOnEdit error: " + (err && err.message ? err.message : err));
-  }
-}
-
-/**
- * Sync ONE row of Main Menu to Calendar (create/update/delete).
- * Deletes event if:
- *  - Triage == Satisfied
- *  - Due Date blank
- *  - Status in REMOVE_EVENT_STATUS_VALUES
- *  - Triage in REMOVE_EVENT_TRIAGE_VALUES
- */
-function syncScholarshipCalendarForRow_(sh, rowNumber, headerIndexMap) {
-  const lock = LockService.getDocumentLock();
-  lock.waitLock(30000);
-
-  try {
-    const h = headerIndexMap || buildHeaderIndex(
-      sh.getRange(HEADER_ROW, 1, 1, sh.getLastColumn()).getValues()[0]
-    );
-
-    const idxName   = optionalIndex_(h, "Scholarship Name");
-    const idxPortal = optionalIndex_(h, COL_APPLICATION_PORTAL);
-    const idxDue    = optionalIndex_(h, "Due Date");
-    const idxTriage = optionalIndex_(h, "Triage");
-    const idxStatus = optionalIndex_(h, "Status");
-    const idxNotes  = optionalIndex_(h, "Notes");
-    const idxEvent  = optionalIndex_(h, CAL_EVENT_COL_NAME);
-
-    if (idxName === null || idxPortal === null || idxDue === null) return;
-    if (idxEvent === null) return; // if you don't have the column, nothing to store
-
-    const lastCol = sh.getLastColumn();
-    const rng = sh.getRange(rowNumber, 1, 1, lastCol);
-
-    const values  = rng.getValues()[0];
-    const display = rng.getDisplayValues()[0];
-
-    const name   = String(values[idxName] || "").trim();
-    const portal = String(values[idxPortal] || "").trim();
-    const dueRaw = values[idxDue];
-    const triage = idxTriage !== null ? String(display[idxTriage] || "").trim().toLowerCase() : "";
-    const status = idxStatus !== null ? String(display[idxStatus] || "").trim().toLowerCase() : "";
-    const notes  = idxNotes !== null ? String(values[idxNotes] || "") : "";
-    let eventId  = String(values[idxEvent] || "").trim();
-
-    // Calendar
-    const calId = PropertiesService.getScriptProperties().getProperty(DEFAULT_CAL_ID_PROP) || "primary";
-    const cal = CalendarApp.getCalendarById(calId);
-    if (!cal) throw new Error(`Could not open calendar: ${calId}`);
-
-    // Removal conditions
-    const dueDate = parseDueDate_(dueRaw); // you already have this helper
-    const shouldRemove =
-      !name ||
-      !portal ||
-      !dueDate ||
-      (triage && REMOVE_EVENT_TRIAGE_VALUES.includes(triage)) ||
-      (status && REMOVE_EVENT_STATUS_VALUES.includes(status)) ||
-      (triage === "satisfied"); // <- your new rule
-
-    if (shouldRemove) {
-      if (eventId) {
-        const ev = safeGetEventById_(cal, eventId);
-        if (ev) ev.deleteEvent();
-        sh.getRange(rowNumber, idxEvent + 1).setValue(""); // clear stored id
-      }
-      return;
-    }
-
-    // Build event
-    const allDay = new Date(dueDate.getFullYear(), dueDate.getMonth(), dueDate.getDate());
-    const eventTitle = `Scholarship Due: ${name}`;
-    const eventDesc =
-      `Scholarship: ${name}\n` +
-      `Portal: ${portal}\n` +
-      `Sheet: ${MAIN_SHEET}\n` +
-      (notes ? `\nNotes:\n${notes}\n` : "");
-
-    // Create if missing
-    if (!eventId) {
-      const ev = cal.createAllDayEvent(eventTitle, allDay, {
-        description: eventDesc,
-        location: portal
-      });
-      applyScholarshipReminders_(ev);
-      sh.getRange(rowNumber, idxEvent + 1).setValue(ev.getId());
-      return;
-    }
-
-    // Update existing (or recreate if date changed)
-    let ev = safeGetEventById_(cal, eventId);
-    if (!ev) {
-      const newEv = cal.createAllDayEvent(eventTitle, allDay, {
-        description: eventDesc,
-        location: portal
-      });
-      applyScholarshipReminders_(newEv);
-      sh.getRange(rowNumber, idxEvent + 1).setValue(newEv.getId());
-      return;
-    }
-
-    const evDate = ev.getAllDayStartDate ? ev.getAllDayStartDate() : ev.getStartTime();
-    const evDay = new Date(evDate.getFullYear(), evDate.getMonth(), evDate.getDate());
-
-    const needsDate = evDay.getTime() !== allDay.getTime();
-    const needsTitle = ev.getTitle() !== eventTitle;
-    const needsLoc = (ev.getLocation() || "") !== portal;
-    const needsDesc = (ev.getDescription() || "") !== eventDesc;
-
-    if (needsDate) {
-      ev.deleteEvent();
-      const repl = cal.createAllDayEvent(eventTitle, allDay, {
-        description: eventDesc,
-        location: portal
-      });
-      applyScholarshipReminders_(repl);
-      sh.getRange(rowNumber, idxEvent + 1).setValue(repl.getId());
-      return;
-    }
-
-    if (needsTitle) ev.setTitle(eventTitle);
-    if (needsLoc) ev.setLocation(portal);
-    if (needsDesc) ev.setDescription(eventDesc);
-
-    ensureScholarshipReminders_(ev);
-  } finally {
-    lock.releaseLock();
-  }
-}
-
+const CAL_EVENT_COL_NAME = "Calendar Event Id";
 
 function syncScholarshipDeadlinesToCalendar() {
   const ss = SpreadsheetApp.getActive();
@@ -2516,10 +1962,7 @@ function syncScholarshipDeadlinesToCalendar() {
 
     const shouldRemove =
       (triage && REMOVE_EVENT_TRIAGE_VALUES.includes(triage)) ||
-      (status && REMOVE_EVENT_STATUS_VALUES.includes(status)) ||
-      (triage === "satisfied") ||   
-      (!dueRaw);                    
-
+      (status && REMOVE_EVENT_STATUS_VALUES.includes(status));
 
     // If marked submitted/surrendered: delete calendar event and clear id
     if (shouldRemove) {
@@ -2693,12 +2136,9 @@ function normalize_(s) {
   return (s ?? "")
     .toString()
     .replace(/\u00A0/g, " ")
-    .replace(/[\u200B-\u200D\uFEFF]/g, "") // zero-width chars
-    .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
 }
-
 function normHeader_(s) {
   return (s ?? "").toString().trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -2734,6 +2174,24 @@ function debugHeaders() {
   logHeaders_();
 }
 
+const DIFFICULTY_OPTIONS = ["Easy", "Medium", "Hard", "Fuck it", "No Idea..."];
+const TRIAGE_OPTIONS = ["Immediate", "Urgent", "Non-Urgent", "Satisfied", "Cooked"];
+const STATUS_OPTIONS = ["Not started", "Scanned", "Prepped", "In Progress", "Completed", "Surrendered"];
+const COL_THEME = "Theme";
+
+// Dropdown options (keep EXACT spelling to match your sheet)
+const THEME_OPTIONS = [
+  "Biomed.", "Comp Sci.", "Business/Entrepreneurship", "Pol. Sci.", "Herritage",
+  "Engineering", "Math/Sci", "First Gen", "Broke", "English/Humanities",
+  "Leadership/Service", "None", "Other"
+];
+
+const REQUIREMENT_OPTIONS = [
+  "Essay(s)", "Rec. Letter(s)", "App./ECs)", "Academics/Transcript",
+  "Field of Study", "Exam(s)", "Interview(s)", "Broke/Finances",
+  "Video/Recording", "Other"
+];
+
 // --- normalize + clamp ---
 function norm_(s) {
   return (s ?? "").toString().trim().toLowerCase().replace(/\u00A0/g, " ").replace(/\s+/g, " ");
@@ -2752,96 +2210,6 @@ function clampToOptions_(raw, options, fallback) {
     if (no.includes(r) || r.includes(no)) return o;
   }
   return fallback;
-}
-
-function buildExistingScholarshipKeySet_() {
-  const ss = SpreadsheetApp.getActive();
-  const set = new Set();
-
-  const sheets = [MAIN_SHEET, RESULTS_SHEET, "Surrendered"];
-
-  sheets.forEach(name => {
-    const sh = ss.getSheetByName(name);
-    if (!sh) return;
-
-    const lastCol = sh.getLastColumn();
-    const lastRow = sh.getLastRow();
-    if (lastRow < 2) return;
-
-    const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0];
-    const h = buildHeaderIndex(headers);
-
-    const idxName = h["Scholarship Name"];
-    const idxPortal = h["Application Portal"];
-
-    if (idxName != null) {
-      const names = sh.getRange(2, idxName + 1, lastRow - 1, 1).getValues();
-      names.forEach(r => {
-        const v = String(r[0] || "").trim().toLowerCase();
-        if (v) set.add("name:" + v);
-      });
-    }
-
-    if (idxPortal != null) {
-      const portals = sh.getRange(2, idxPortal + 1, lastRow - 1, 1).getValues();
-      portals.forEach(r => {
-        const v = String(r[0] || "").trim();
-        if (v) set.add("portal:" + v);
-      });
-    }
-  });
-
-  return set;
-}
-
-function canvasFingerprint_(title, body, url) {
-  const s = normalize_([title, body, url].join(" | ")).slice(0, 2000);
-  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s);
-  return bytes.map(b => (b < 0 ? b + 256 : b).toString(16).padStart(2, "0")).join("");
-}
-
-function extractFirstUrl_(text) {
-  const m = String(text || "").match(/https?:\/\/[^\s)"'>]+/i);
-  return m ? m[0] : "";
-}
-
-function debugWriteCanvasIntake_() {
-  const ss = SpreadsheetApp.getActive();
-  const intake = ss.getSheetByName("Canvas Intake");
-  if (!intake) throw new Error('Missing sheet: "Canvas Intake"');
-
-  intake.appendRow([
-    new Date(),
-    "debug:key",
-    "debug profile",
-    "debug course",
-    "Announcement",
-    "Debug intake write works",
-    new Date().toISOString(),
-    "https://example.com",
-    "debug body"
-  ]);
-
-  Logger.log("✅ Debug row appended to Canvas Intake.");
-}
-
-
-function canonicalizeUrl_(u) {
-  if (!u) return "";
-  let s = String(u).trim();
-  if (!/^https?:\/\//i.test(s)) return s;
-
-  // strip common tracking query params
-  const parts = s.split("?");
-  let base = parts[0].replace(/\/+$/, ""); // no trailing slash
-  if (parts.length === 1) return base;
-
-  const query = parts[1]
-    .split("&")
-    .filter(kv => kv && !/^utm_/i.test(kv) && !/^fbclid=/i.test(kv) && !/^gclid=/i.test(kv))
-    .join("&");
-
-  return query ? (base + "?" + query) : base;
 }
 
 // --- parse Due Date robustly ---
@@ -3127,87 +2495,6 @@ function canvasDeepFetchTextForModuleItem_(courseId, mi) {
   }
 }
 
-function cacheSetJson_(key, obj, ttlSeconds) {
-  const cache = CacheService.getScriptCache();
-  const str = JSON.stringify(obj);
-  // Cache has size limits; if too big, fallback to Properties (chunked)
-  try {
-    cache.put(key, str, ttlSeconds);
-    return true;
-  } catch (e) {
-    // fallback: chunk into ScriptProperties
-    const props = PropertiesService.getScriptProperties();
-    const chunkSize = 8000; // safe-ish
-    const chunks = [];
-    for (let i = 0; i < str.length; i += chunkSize) chunks.push(str.slice(i, i + chunkSize));
-    props.setProperty(key + ":n", String(chunks.length));
-    chunks.forEach((c, i) => props.setProperty(key + ":" + i, c));
-    props.setProperty(key + ":exp", String(Date.now() + ttlSeconds * 1000));
-    return true;
-  }
-}
-
-function cacheGetJson_(key) {
-  const cache = CacheService.getScriptCache();
-  const hit = cache.get(key);
-  if (hit) return JSON.parse(hit);
-
-  const props = PropertiesService.getScriptProperties();
-  const exp = Number(props.getProperty(key + ":exp") || "0");
-  if (!exp || Date.now() > exp) return null;
-
-  const n = Number(props.getProperty(key + ":n") || "0");
-  if (!n) return null;
-
-  let str = "";
-  for (let i = 0; i < n; i++) str += (props.getProperty(key + ":" + i) || "");
-  return str ? JSON.parse(str) : null;
-}
-
-function extractIncomeCap_(t) {
-  // matches: "income under $80,000" / "household income less than 100000"
-  const m = t.match(/\b(household|family)?\s*income\s*(under|less than|below|<=?)\s*\$?\s*([\d,]{4,})\b/i);
-  if (!m) return null;
-  const n = Number(String(m[3]).replace(/,/g, ""));
-  return isNaN(n) ? null : n;
-}
-
-function extractSaiCap_(t) {
-  // matches: "SAI under 15000" / "Student Aid Index <= 20000"
-  const m = t.match(/\b(sai|student aid index)\s*(under|less than|below|<=?)\s*([\d,]{3,})\b/i);
-  if (!m) return null;
-  const n = Number(String(m[3]).replace(/,/g, ""));
-  return isNaN(n) ? null : n;
-}
-
-function extractAnyDate_(t) {
-  // Conservative: looks for YYYY-MM-DD or MM/DD/YYYY or "Mar 1, 2026"
-  // Returns Date or null.
-  let m = t.match(/\b(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})\b/);
-  if (m) {
-    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  m = t.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/);
-  if (m) {
-    let y = Number(m[3]);
-    if (y < 100) y += 2000;
-    const d = new Date(y, Number(m[1]) - 1, Number(m[2]));
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  m = t.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{1,2})(,)?\s+(20\d{2})\b/i);
-  if (m) {
-    const monthMap = {jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,sept:8,oct:9,nov:10,dec:11};
-    const mm = monthMap[m[1].toLowerCase()];
-    const d = new Date(Number(m[4]), mm, Number(m[2]));
-    return isNaN(d.getTime()) ? null : d;
-  }
-
-  return null;
-}
-
 function installDailyTriageRefreshTrigger() {
   // runs around 6am in your spreadsheet’s timezone
   ScriptApp.newTrigger("refreshTriageForMainMenu")
@@ -3229,19 +2516,11 @@ function findColByNorm_(headerRow, targetNorm) {
   return null;
 }
 
-function debugCanvasCourseNames() {
-  const url = CANVAS_BASE + "/api/v1/courses?per_page=100&fields[]=id&fields[]=name";
-  const courses = canvasFetchJson_(url) || [];
-  Logger.log("Course count: " + courses.length);
-  courses.forEach(c => Logger.log(`${c.id} | ${c.name}`));
-}
-
 function safeGetEventById_(cal, eventId) {
-  if (!cal || !eventId) return null;
   try {
     return cal.getEventById(eventId);
   } catch (e) {
-    return null; // prevents crash if event doesn't exist
+    return null;
   }
 }
 

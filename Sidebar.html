@@ -27,28 +27,28 @@
 
     <div class="status small" id="status"></div>
 
+
     <script>
-      function setStatus(msg) {
-        document.getElementById("status").textContent = msg;
-      }
+    function setStatus(msg) {
+      document.getElementById("status").textContent = msg || "";
+    }
 
-      function submit() {
-        setStatus("Working...");
-        const payload = {
-          url: document.getElementById("url").value.trim(),
-          pastedText: document.getElementById("pastedText").value,
-          extraNotes: document.getElementById("extraNotes").value
-        };
+    function submit() {
+      setStatus("Working...");
 
-        google.script.run
-          .withSuccessHandler((res) => {
-            setStatus("Added! Row: " + res.addedRow);
-          })
-          .withFailureHandler((err) => {
-            setStatus("Error: " + (err && err.message ? err.message : err));
-          })
-          .aiAddScholarship(payload);
-      }
-    </script>
-  </body>
-</html>
+      const payload = {
+        url: document.getElementById("url").value.trim(),
+        pastedText: document.getElementById("pastedText").value,
+        extraNotes: document.getElementById("extraNotes").value
+      };
+
+      google.script.run
+        .withSuccessHandler((res) => {
+          setStatus("Uploaded Row: " + (res && res.addedRow ? res.addedRow : "?"));
+        })
+        .withFailureHandler((err) => {
+          setStatus("Womp Womp " + (err && err.message ? err.message : err));
+        })
+        .aiAddScholarship(payload);
+  }
+</script>
