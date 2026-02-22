@@ -168,6 +168,12 @@ if (idxDue !== null && extracted.due) row[idxDue] = extracted.due;
     sh.appendRow(row);
     const addedRow = sh.getLastRow();
 
+    // Auto-create Application File (essay doc) if applicable
+    autoCreateEssayDocForRow_(sh, addedRow, extracted, ctx);
+
+    // Draft recommender emails
+    draftRecEmailsForRow_(sh, addedRow);
+
     // Make portal clickable
     if (row[idxPortal] && looksLikeUrl_(row[idxPortal])) {
       const rt = SpreadsheetApp.newRichTextValue()
@@ -181,6 +187,23 @@ if (idxDue !== null && extracted.due) row[idxDue] = extracted.due;
   } finally {
     lock.releaseLock();
   }
+}
+
+function aiSidebarUploadFile(payload) {
+  payload = payload || {};
+  const name = (payload.name || ("upload_" + Date.now())).toString();
+  const mimeType = (payload.mimeType || "application/octet-stream").toString();
+  const data = payload.data || [];
+  if (!data.length) throw new Error("No file bytes received.");
+
+  const blob = Utilities.newBlob(data, mimeType, name);
+  const f = DriveApp.createFile(blob);
+  return {
+    driveFileId: f.getId(),
+    driveUrl: f.getUrl(),
+    name: f.getName(),
+    mimeType: f.getMimeType()
+  };
 }
 
 function detectEssayPrompt_(text) {
@@ -208,73 +231,665 @@ function detectEssayPrompt_(text) {
   return t.slice(0, 900).trim();
 }
 
-function createEssayDoc_(scholarshipName, sourceUrl, promptText) {
-  const safeName = (scholarshipName || "Scholarship").toString().trim();
-  const docTitle = `${safeName} (Essay Prompt)`;
+function buildMainMenuDedupeSets_() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(MAIN_SHEET);
+  if (!sh) throw new Error(`Sheet not found: ${MAIN_SHEET}`);
 
-  const doc = DocumentApp.create(docTitle);
-  const body = doc.getBody();
-  body.clear();
+  const lastCol = sh.getLastColumn();
+  const headers = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
+  const h = buildHeaderIndex(headers);
+  const idxName = mustIndex(h, "Scholarship Name");
+  const idxPortal = mustIndex(h, "Application Portal");
 
-  // Title
-  const pTitle = body.appendParagraph(docTitle);
-  pTitle.setHeading(DocumentApp.ParagraphHeading.TITLE);
-  pTitle.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 30,
-    [DocumentApp.Attribute.BOLD]: true
+  const portal = new Set();
+  const name = new Set();
+
+  const lr = sh.getLastRow();
+  if (lr >= HEADER_ROW + 1) {
+    const vals = sh.getRange(HEADER_ROW + 1, 1, lr - HEADER_ROW, lastCol).getValues();
+    vals.forEach(r => {
+      const nm = String(r[idxName] || "").trim().toLowerCase();
+      const po = String(r[idxPortal] || "").trim().toLowerCase();
+      if (nm) name.add(nm);
+      if (po) portal.add(po);
+    });
+  }
+
+  return { portal, name };
+}
+
+function aiSidebarIngest(payload) {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    payload = payload || {};
+    const url = (payload.url || "").toString().trim();
+    const pastedText = (payload.pastedText || "").toString();
+    const extraNotes = (payload.extraNotes || "").toString();
+    const uploadedFile = payload.uploadedFile || null;
+
+    // 1) Build sourceText priority: paste > upload text > URL > dataset URL
+    let sourceText = (pastedText || "").trim();
+    let uploadedUrl = "";
+
+    if (!sourceText && uploadedFile && uploadedFile.driveFileId) {
+      uploadedUrl = uploadedFile.driveUrl || "";
+      sourceText = extractTextFromDriveFile_(uploadedFile.driveFileId, uploadedFile.mimeType);
+    }
+
+    if (!sourceText && url) {
+      sourceText = fetchUrlAsTextSmart_(url) || "";
+    }
+
+    // Dataset fallback (sheet/csv)
+    if (!sourceText && url) {
+      sourceText = extractTextFromDatasetUrl_(url) || "";
+    }
+
+    if (!sourceText || sourceText.trim().length < 40) {
+      throw new Error("Need more text. Paste text, upload a PDF, or provide a working URL.");
+    }
+
+    // 2) Batch extract (with chunking if needed)
+    const meta = { url, uploadedUrl, extraNotes };
+
+    const chunks = chunkText_(sourceText, 12000);
+    let all = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const batch = geminiExtractScholarshipsBatch_(chunks[i], Object.assign({}, meta, { chunk_index: i + 1, chunks_total: chunks.length }));
+      all = all.concat(batch.items || []);
+    }
+    const items = mergeBatchItems_(all);
+
+    // 3) If URL exists and some items are missing critical fields, do one URL “assist” pass
+    // (lightweight: only if URL fetch succeeds and missing fields exist)
+    if (url) {
+      const missingAny = items.some(it =>
+        (!it.due_date || it.due_date.length < 4) ||
+        (!it.portal_url || it.portal_url.length < 8)
+      );
+      if (missingAny) {
+        const urlText = fetchUrlAsTextSmart_(url);
+        if (urlText && urlText.length > 200) {
+          const assist = geminiExtractScholarshipsBatch_(urlText.slice(0, 12000), Object.assign({}, meta, { assist_pass: true }));
+          const mergedAssist = mergeBatchItems_(items.concat(assist.items || []));
+          // Prefer original items, but fill blanks from assist
+          const filled = mergedAssist.map(it => it); // already merged; ok for most docs
+          items.length = 0;
+          Array.prototype.push.apply(items, filled);
+        }
+      }
+    }
+
+    // 4) Build sheet dedupe sets once
+    const dedupe = buildMainMenuDedupeSets_();
+
+    // 5) Apply gates + append
+    const results = {
+      action: "BATCH_DONE",
+      total_extracted: items.length,
+      appended: 0,
+      appended_rows: [],
+      skipped: {
+        past_due: [],
+        not_eligible: [],
+        duplicate_portal: [],
+        duplicate_name: [],
+        invalid: []
+      }
+    };
+
+    items.forEach(it => {
+      const nm = String(it.name || "").trim();
+      const po = String(it.portal_url || url || "").trim();
+
+      if (!nm || nm.length < 3) {
+        results.skipped.invalid.push({ name: nm, portal: po, reason: "missing_name" });
+        return;
+      }
+
+      const dueObj = parseDueDate_(it.due_date || "");
+      if (dueObj && isPastDue_(dueObj)) {
+        results.skipped.past_due.push({ name: nm, due_date: it.due_date || "" });
+        return;
+      }
+
+      if (String(it.is_eligible || "unknown").toLowerCase() === "no") {
+        results.skipped.not_eligible.push({ name: nm, reason: it.eligibility || "" });
+        return;
+      }
+
+      const portalKey = po.toLowerCase();
+      const nameKey = nm.toLowerCase();
+
+      if (po && dedupe.portal.has(portalKey)) {
+        results.skipped.duplicate_portal.push({ name: nm, portal: po });
+        return;
+      }
+      if (dedupe.name.has(nameKey)) {
+        results.skipped.duplicate_name.push({ name: nm });
+        return;
+      }
+
+      const writeRes = upsertScholarshipToMainMenu_(it, {
+        url,
+        uploadedUrl,
+        extraNotes,
+        sourceText: "" // don’t store full mega text
+      });
+
+      if (writeRes.action === "APPENDED") {
+        results.appended++;
+        results.appended_rows.push(writeRes.row);
+
+        // Update dedupe sets so duplicates in same ingest don't pass
+        if (po) dedupe.portal.add(portalKey);
+        dedupe.name.add(nameKey);
+      } else {
+        // upsert function already dedupes; classify roughly
+        if (writeRes.action === "SKIP_DUPLICATE_PORTAL") results.skipped.duplicate_portal.push({ name: nm, portal: po });
+        else if (writeRes.action === "SKIP_DUPLICATE_NAME") results.skipped.duplicate_name.push({ name: nm });
+        else results.skipped.invalid.push({ name: nm, portal: po, reason: writeRes.action });
+      }
+    });
+
+    return results;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function aiSidebarChat(payload) {
+  payload = payload || {};
+  const msg = String(payload.message || "").trim();
+  if (!msg) return { type: "reply", text: "" };
+
+  const tools = getAutoshipToolRegistry_();
+  const plan = geminiDecideChatOrTool_(msg, tools);
+
+  if (!plan || plan.type === "reply") {
+    return { type: "reply", text: String(plan?.text || "") };
+  }
+
+  if (plan.type === "choose_recommenders") {
+    return {
+      type: "choose_recommenders",
+      text: String(plan.text || "Select which recommender(s) to draft to:"),
+      row: Number(plan.row || 0),
+      options: Array.isArray(plan.options) ? plan.options : listRecommenders_()
+    };
+  }
+
+  if (plan.type === "tool_call") {
+    const toolName = String(plan.tool || "");
+    const args = plan.args || {};
+    const execRes = executeAutoshipTool_(toolName, args, tools);
+    const finalText = geminiSummarizeToolResult_(msg, toolName, args, execRes);
+    return { type: "reply", text: finalText };
+  }
+
+  return { type: "reply", text: "I couldn't determine an action." };
+}
+
+function geminiDecideChatOrTool_(userMsg, tools) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("Missing Script Property: GEMINI_API_KEY");
+
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(GEMINI_MODEL) +
+    ":generateContent?key=" +
+    encodeURIComponent(apiKey);
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      type: { type: "string", enum: ["reply", "tool_call", "choose_recommenders"] },
+      text: { type: "string" },
+      tool: { type: "string" },
+      args: { type: "object" },
+      row: { type: "number" },
+      options: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            name: { type: "string" },
+            email: { type: "string" },
+            role: { type: "string" }
+          },
+          required: ["name", "email", "role"]
+        }
+      }
+    },
+    required: ["type"]
+  };
+
+  const toolList = tools.map(t => ({
+    name: t.name,
+    description: t.description,
+    argsSchema: t.argsSchema
+  }));
+
+  const recs = listRecommenders_();
+  const prompt = [
+    "You are Autoship Sidebar AI. Decide whether to answer normally, run a tool, or ask the user to choose recommenders.",
+    "If the user requests drafting recommendation emails, respond with type=choose_recommenders and include options from the recommender list.",
+    "Only include recommenders that exist in the list.",
+    "",
+    "Recommender list:",
+    JSON.stringify(recs),
+    "",
+    "Tool list:",
+    JSON.stringify(toolList),
+    "",
+    "Return ONLY JSON matching this schema:",
+    JSON.stringify(schema),
+    "",
+    "User message:",
+    userMsg
+  ].join("\n");
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: "application/json", temperature: 0.1 }
+  };
+
+  const res = UrlFetchApp.fetch(endpoint, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true
   });
 
-  // Heading 1: Source
-  const pH1 = body.appendParagraph("Source");
-  pH1.setHeading(DocumentApp.ParagraphHeading.HEADING1);
-  pH1.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 24,
-    [DocumentApp.Attribute.BOLD]: true
+  if (res.getResponseCode() < 200 || res.getResponseCode() >= 300) {
+    return { type: "reply", text: "AI tool router error." };
+  }
+
+  const raw = JSON.parse(res.getContentText() || "{}");
+  const text = (raw?.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("").trim();
+  if (!text) return { type: "reply", text: "" };
+
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    return { type: "reply", text: text };
+  }
+}
+
+function executeAutoshipTool_(toolName, args, tools) {
+  const reg = tools.find(t => t.name === toolName);
+  if (!reg) throw new Error("Tool not allowed: " + toolName);
+
+  // Minimal safety: args must be an object
+  if (args === null || typeof args !== "object" || Array.isArray(args)) {
+    throw new Error("Invalid args for tool: " + toolName);
+  }
+
+  // Execute by name (allowlisted)
+  const fn = this[toolName];
+  if (typeof fn !== "function") throw new Error("Tool function not found: " + toolName);
+
+  // Tools can be no-arg or single-arg (your aiSidebarIngest takes payload)
+  try {
+    const arity = fn.length;
+    if (arity === 0) return fn();
+    return fn(args);
+  } catch (e) {
+    return { error: String(e && e.message ? e.message : e) };
+  }
+}
+
+function geminiSummarizeToolResult_(userMsg, toolName, args, toolResult) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) return JSON.stringify(toolResult, null, 2);
+
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(GEMINI_MODEL) +
+    ":generateContent?key=" +
+    encodeURIComponent(apiKey);
+
+  const prompt = [
+    "You are Autoship Sidebar AI.",
+    "Explain the result of running a scholarship tool clearly and briefly.",
+    "If there is an error, tell the user what to do next.",
+    "",
+    "User message:",
+    userMsg,
+    "",
+    "Tool executed:",
+    toolName,
+    "Args:",
+    JSON.stringify(args),
+    "",
+    "Tool result:",
+    JSON.stringify(toolResult)
+  ].join("\n");
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.2 }
+  };
+
+  const res = UrlFetchApp.fetch(endpoint, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true
   });
 
-  // Normal text: URL
-  const pUrl = body.appendParagraph(sourceUrl || "");
-  pUrl.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 12
+  if (res.getResponseCode() < 200 || res.getResponseCode() >= 300) {
+    return JSON.stringify(toolResult, null, 2);
+  }
+
+  const raw = JSON.parse(res.getContentText() || "{}");
+  const text = (raw?.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("").trim();
+  return text || JSON.stringify(toolResult, null, 2);
+}
+
+function geminiSummarizeToolResult_(userMsg, toolName, args, toolResult) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) return JSON.stringify(toolResult, null, 2);
+
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(GEMINI_MODEL) +
+    ":generateContent?key=" +
+    encodeURIComponent(apiKey);
+
+  const prompt = [
+    "You are Autoship Sidebar AI.",
+    "Explain the result of running a scholarship tool clearly and briefly.",
+    "If there is an error, tell the user what to do next.",
+    "",
+    "User message:",
+    userMsg,
+    "",
+    "Tool executed:",
+    toolName,
+    "Args:",
+    JSON.stringify(args),
+    "",
+    "Tool result:",
+    JSON.stringify(toolResult)
+  ].join("\n");
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.2 }
+  };
+
+  const res = UrlFetchApp.fetch(endpoint, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true
   });
 
-  // Heading 1: Prompt
-  const pH2 = body.appendParagraph("Prompt");
-  pH2.setHeading(DocumentApp.ParagraphHeading.HEADING1);
-  pH2.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 24,
-    [DocumentApp.Attribute.BOLD]: true
+  if (res.getResponseCode() < 200 || res.getResponseCode() >= 300) {
+    return JSON.stringify(toolResult, null, 2);
+  }
+
+  const raw = JSON.parse(res.getContentText() || "{}");
+  const text = (raw?.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("").trim();
+  return text || JSON.stringify(toolResult, null, 2);
+}
+
+function geminiExtractScholarshipsBatch_(sourceText, meta) {
+  meta = meta || {};
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("Missing Script Property: GEMINI_API_KEY");
+
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(GEMINI_MODEL) +
+    ":generateContent?key=" +
+    encodeURIComponent(apiKey);
+
+  const itemSchema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      name: { type: "string" },
+      portal_url: { type: "string" },
+      due_date: { type: "string" },
+      amount: { type: "string" },
+      eligibility: { type: "string" },
+      is_eligible: { type: "string", enum: ["yes", "no", "unknown"] },
+      requirements: { type: "array", items: { type: "string" } },
+      theme: { type: "array", items: { type: "string" } },
+      notes: { type: "string" }
+    },
+    required: [
+      "name", "portal_url", "due_date", "amount", "eligibility",
+      "is_eligible", "requirements", "theme", "notes"
+    ]
+  };
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      items: { type: "array", items: itemSchema },
+      notes: { type: "string" }
+    },
+    required: ["items", "notes"]
+  };
+
+  const prompt = [
+    "Extract ALL scholarships from the source text.",
+    "Return ONLY valid JSON (no markdown).",
+    "",
+    "Rules:",
+    "- Output must match schema exactly.",
+    "- Each scholarship should be one item in items[].",
+    "- If portal_url missing, use meta.url if it clearly applies; otherwise empty.",
+    "- due_date: use exact date if present; else empty.",
+    "- requirements/theme: short tags (sheet dropdown vocabulary if possible).",
+    "- is_eligible: decide based on eligibility criteria vs applicant profile below.",
+    "- If one document lists many scholarships, include them all.",
+    "",
+    "Applicant profile:",
+    "- US high school senior class of 2026 in Arlington, TX",
+    "",
+    "Meta:",
+    JSON.stringify(meta),
+    "",
+    "JSON Schema:",
+    JSON.stringify(schema),
+    "",
+    "SOURCE TEXT:",
+    (sourceText || "").slice(0, 12000)
+  ].join("\n");
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: "application/json", temperature: 0.1 }
+  };
+
+  const res = UrlFetchApp.fetch(endpoint, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true
   });
 
-  // Normal text: prompt
-  const pPrompt = body.appendParagraph((promptText || "").trim());
-  pPrompt.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 12
+  const code = res.getResponseCode();
+  const raw = res.getContentText() || "";
+  if (code < 200 || code >= 300) throw new Error("Gemini batch extraction failed: HTTP " + code);
+
+  const parsed = JSON.parse(raw);
+  const text = (parsed?.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("").trim();
+  if (!text) throw new Error("Gemini returned empty batch extraction.");
+
+  const obj = JSON.parse(text);
+  obj.items = Array.isArray(obj.items) ? obj.items : [];
+  obj.items.forEach(it => {
+    it.requirements = uniq_((it.requirements || []).map(String));
+    it.theme = uniq_((it.theme || []).map(String));
+    it.name = String(it.name || "").trim();
+    it.portal_url = String(it.portal_url || "").trim();
+    it.due_date = String(it.due_date || "").trim();
+    it.amount = String(it.amount || "").trim();
+    it.eligibility = String(it.eligibility || "").trim();
+    it.is_eligible = String(it.is_eligible || "unknown").toLowerCase();
+    it.notes = String(it.notes || "").trim();
   });
 
-  // Heading 1: Notes
-  const pH3 = body.appendParagraph("Notes");
-  pH3.setHeading(DocumentApp.ParagraphHeading.HEADING1);
-  pH3.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 24,
-    [DocumentApp.Attribute.BOLD]: true
+  return obj;
+}
+
+function chunkText_(text, maxChars) {
+  text = String(text || "");
+  maxChars = Math.max(2000, Number(maxChars) || 12000);
+
+  const chunks = [];
+  let i = 0;
+  while (i < text.length) {
+    const end = Math.min(i + maxChars, text.length);
+    chunks.push(text.slice(i, end));
+    i = end;
+  }
+  return chunks;
+}
+
+function mergeBatchItems_(allItems) {
+  // Dedupe within batch by portal_url then name (case-insensitive)
+  const byPortal = new Map();
+  const byName = new Map();
+  const out = [];
+
+  allItems.forEach(it => {
+    const portalKey = (it.portal_url || "").trim().toLowerCase();
+    const nameKey = (it.name || "").trim().toLowerCase();
+    if (portalKey && byPortal.has(portalKey)) return;
+    if (!portalKey && nameKey && byName.has(nameKey)) return;
+
+    out.push(it);
+    if (portalKey) byPortal.set(portalKey, true);
+    if (nameKey) byName.set(nameKey, true);
   });
 
-  // Normal placeholder
-  const pNotes = body.appendParagraph("");
-  pNotes.setAttributes({
-    [DocumentApp.Attribute.FONT_FAMILY]: "Times New Roman",
-    [DocumentApp.Attribute.FONT_SIZE]: 12
+  return out;
+}
+function fetchUrlAsTextSmart_(url) {
+  const u = String(url || "").trim();
+  if (!u) return "";
+  const lower = u.toLowerCase();
+  if (lower.endsWith(".pdf") || lower.includes(".pdf?")) return fetchPdfAsTextViaDriveConvert_(u);
+  return fetchHtmlAsText_(u);
+}
+
+function extractTextFromDatasetUrl_(url) {
+  const u = String(url || "").trim();
+  if (!u) return "";
+
+  // Google Sheet
+  if (/docs\.google\.com\/spreadsheets\/d\//i.test(u)) {
+    const id = extractDriveIdFromUrl_(u);
+    if (!id) return "";
+    const ss = SpreadsheetApp.openById(id);
+    const sh = ss.getSheets()[0];
+    const values = sh.getDataRange().getDisplayValues();
+    // Turn first N rows into a compact text blob
+    const maxRows = Math.min(values.length, 200);
+    const maxCols = Math.min(values[0].length, 20);
+    const lines = [];
+    for (let r = 0; r < maxRows; r++) {
+      lines.push(values[r].slice(0, maxCols).join(" | "));
+    }
+    return lines.join("\n");
+  }
+
+  // CSV (basic)
+  if (u.toLowerCase().includes(".csv")) {
+    const res = UrlFetchApp.fetch(u, { muteHttpExceptions: true, followRedirects: true });
+    if (res.getResponseCode() < 200 || res.getResponseCode() >= 300) return "";
+    const csv = res.getContentText() || "";
+    const rows = Utilities.parseCsv(csv);
+    const maxRows = Math.min(rows.length, 200);
+    const maxCols = Math.min(rows[0].length, 20);
+    return rows.slice(0, maxRows).map(r => r.slice(0, maxCols).join(" | ")).join("\n");
+  }
+
+  return "";
+}
+
+function createEssayDocForRow_(sheet, absoluteRow, opts) {
+  opts = opts || {};
+  const headers = sheet.getRange(HEADER_ROW, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const h = buildHeaderIndex(headers);
+
+  const idxReq     = optionalIndex_(h, COL_REQUIREMENTS);
+  const idxPortal  = optionalIndex_(h, COL_APPLICATION_PORTAL);
+  const idxAppFile = optionalIndex_(h, COL_APPLICATION_FILE);
+  const idxName    = optionalIndex_(h, "Scholarship Name");
+
+  const idxDocId   = optionalIndex_(h, "Essay Doc ID");
+  const idxStatus  = optionalIndex_(h, "Status");
+  const idxDue     = optionalIndex_(h, "Due Date");
+  const idxTriage  = optionalIndex_(h, "Triage");
+
+  if (idxReq === null || idxAppFile === null || idxName === null) {
+    throw new Error(`Missing required columns on "${MAIN_SHEET}"`);
+  }
+
+  const lastCol = sheet.getLastColumn();
+  const row = sheet.getRange(absoluteRow, 1, 1, lastCol).getValues()[0];
+  const rich = sheet.getRange(absoluteRow, 1, 1, lastCol).getRichTextValues()[0];
+  const formulas = sheet.getRange(absoluteRow, 1, 1, lastCol).getFormulas()[0];
+
+  const reqText = String(row[idxReq] ?? "");
+  const name = String(row[idxName] ?? "").trim() || "Scholarship";
+
+  // Skip if requirements doesn't include Essay(s), unless forced
+  const needsEssay = requirementsIncludes_(reqText, ESSAY_REQUIREMENT_TOKEN);
+  if (!needsEssay && !opts.force) return { action: "SKIP_NO_ESSAY_REQUIREMENT" };
+
+  // Skip if already has a doc
+  const appFileCell = sheet.getRange(absoluteRow, idxAppFile + 1);
+  const existingUrl = extractDocUrlFromCell_(appFileCell);
+  if (existingUrl) return { action: "SKIP_ALREADY_HAS_DOC", url: existingUrl };
+
+  const portalUrl = (idxPortal !== null)
+    ? extractBestUrlFromCell_(formulas[idxPortal], rich[idxPortal], String(row[idxPortal] ?? ""))
+    : "";
+
+  // Prompt extraction: use provided sourceText if present, else fetch portal
+  let sourceText = String(opts.sourceText || "").trim();
+  if ((!sourceText || sourceText.length < 40) && portalUrl) {
+    sourceText = fetchUrlAsTextSmart_(portalUrl) || "";
+  }
+
+  const ep = (sourceText && sourceText.length >= 40)
+    ? geminiExtractEssayPrompt_(sourceText.slice(0, 12000), portalUrl)
+    : { prompt_text: "", word_limit: "", pdf_required: false };
+
+  const docInfo = createEssayPrepDocOneDraft_({
+    scholarshipName: name,
+    portalUrl,
+    promptText: ep.prompt_text || "",
+    wordLimit: ep.word_limit || ""
   });
 
-  doc.saveAndClose();
-  return doc.getUrl();
+  if (idxDocId !== null && docInfo && docInfo.id) {
+    sheet.getRange(absoluteRow, idxDocId + 1).setValue(docInfo.id);
+  }
+
+  appendLinkIntoCell_(sheet, absoluteRow, idxAppFile + 1, "Essay Draft (Google Doc)", docInfo.url);
+
+  if (idxStatus !== null) sheet.getRange(absoluteRow, idxStatus + 1).setValue("Prepped");
+
+  if (idxDue !== null && idxTriage !== null) {
+    const due = parseSheetDate_(row[idxDue]);
+    sheet.getRange(absoluteRow, idxTriage + 1).setValue(computeTriage_(due, row[idxTriage]));
+  }
+
+  return { action: "CREATED_DOC", url: docInfo.url, id: docInfo.id || "" };
 }
 /*******************************
  * CANVAS → AUTOSHIP INTAKE
@@ -939,6 +1554,101 @@ function createEssayDocsForSelection() {
   );
 }
 
+function upsertScholarshipToMainMenu_(extracted, ctx) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(MAIN_SHEET);
+  if (!sh) throw new Error(`Sheet not found: ${MAIN_SHEET}`);
+
+  const lastCol = sh.getLastColumn();
+  const headers = sh.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0];
+  const h = buildHeaderIndex(headers);
+
+  const idxName = mustIndex(h, "Scholarship Name");
+  const idxPortal = mustIndex(h, "Application Portal");
+  const idxDue = optionalIndex_(h, "Due Date");
+  const idxReq = optionalIndex_(h, "Requirements");
+  const idxTheme = optionalIndex_(h, COL_THEME);
+  const idxNotes = optionalIndex_(h, "Notes");
+  const idxStatus = optionalIndex_(h, "Status");
+  const idxTriage = optionalIndex_(h, "Triage");
+  const idxStart = optionalIndex_(h, "Start date");
+  const idxDifficulty = optionalIndex_(h, "Difficulty");
+
+  // Build dedupe set from existing portal + name
+  const existingPortal = new Set();
+  const existingName = new Set();
+  const lr = sh.getLastRow();
+  if (lr >= HEADER_ROW + 1) {
+    const vals = sh.getRange(HEADER_ROW + 1, 1, lr - HEADER_ROW, lastCol).getValues();
+    vals.forEach(r => {
+      const nm = String(r[idxName] || "").trim().toLowerCase();
+      const po = String(r[idxPortal] || "").trim().toLowerCase();
+      if (nm) existingName.add(nm);
+      if (po) existingPortal.add(po);
+    });
+  }
+
+  const portal = String(extracted.portal_url || ctx.url || "").trim();
+  const name = String(extracted.name || "Scholarship").trim();
+
+  if (portal && existingPortal.has(portal.toLowerCase())) return { action: "SKIP_DUPLICATE_PORTAL" };
+  if (name && existingName.has(name.toLowerCase())) return { action: "SKIP_DUPLICATE_NAME" };
+
+  const row = new Array(lastCol).fill("");
+  row[idxName] = name;
+  row[idxPortal] = portal;
+
+  if (idxDue !== null && extracted.due_date) row[idxDue] = extracted.due_date;
+
+  if (idxReq !== null) {
+    // You already have detectRequirementsFromText_() + joinMultiSelect_()
+    const req = uniq_([].concat(extracted.requirements || []));
+    row[idxReq] = joinMultiSelect_(req);
+  }
+
+  if (idxTheme !== null) {
+    const th = uniq_([].concat(extracted.theme || []));
+    row[idxTheme] = joinMultiSelect_(th);
+  }
+
+  if (idxNotes !== null) {
+    const sources = []
+      .concat(ctx.url ? ["URL=" + ctx.url] : [])
+      .concat(ctx.uploadedUrl ? ["Upload=" + ctx.uploadedUrl] : [])
+      .filter(Boolean)
+      .join(" | ");
+
+    const eligibility = extracted.eligibility ? ("Eligibility: " + extracted.eligibility) : "";
+    const amount = extracted.amount ? ("Amount: " + extracted.amount) : "";
+    const extra = (ctx.extraNotes || "").trim();
+
+    row[idxNotes] = [sources, amount, eligibility, extra].filter(Boolean).join("\n");
+  }
+
+  if (idxStart !== null) row[idxStart] = new Date();
+  if (idxDifficulty !== null) row[idxDifficulty] = "No Idea...";
+  if (idxStatus !== null) row[idxStatus] = "Scanned";
+
+   if (idxTriage !== null) {
+    const dueObj = parseDueDate_(row[idxDue]);
+    row[idxTriage] = computeTriage_(dueObj, "");
+  }
+
+  sh.appendRow(row);
+  const addedRow = sh.getLastRow();
+
+  // === AUTO: create essay doc after append (only if prompt exists) ===
+  autoCreateEssayDocForRow_(sh, addedRow, extracted, ctx);
+
+  // Make portal clickable
+  if (portal && looksLikeUrl_(portal)) {
+    const rt = SpreadsheetApp.newRichTextValue().setText(portal).setLinkUrl(portal).build();
+    sh.getRange(addedRow, idxPortal + 1).setRichTextValue(rt);
+  }
+
+  return { action: "APPENDED", row: addedRow };
+}
+
 /*************************************************
  * 2) SLOW: Fill prompt(s) with AI for selected rows
  * - Only if Requirements includes "Essay(s)"
@@ -1094,6 +1804,47 @@ function deleteEssayDocsForSelection() {
     "Scholarship Tools",
     8
   );
+}
+
+function deleteEssayDocForRow_(sheet, absoluteRow) {
+  const headers = sheet.getRange(HEADER_ROW, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const h = buildHeaderIndex(headers);
+
+  const idxAppFile = optionalIndex_(h, COL_APPLICATION_FILE);
+  const idxDocId   = optionalIndex_(h, "Essay Doc ID");
+  if (idxAppFile === null) throw new Error("Missing Application File column");
+
+  let docId = "";
+  if (idxDocId !== null) {
+    docId = String(sheet.getRange(absoluteRow, idxDocId + 1).getDisplayValue() || "").trim();
+  }
+
+  if (!docId) {
+    const url = extractDocUrlFromCell_(sheet.getRange(absoluteRow, idxAppFile + 1)) || "";
+    docId = extractDriveIdFromUrl_(url) || "";
+  }
+
+  if (!docId) return { action: "SKIP_NO_DOC_FOUND" };
+
+  DriveApp.getFileById(docId).setTrashed(true);
+
+  // Clear cells
+  sheet.getRange(absoluteRow, idxAppFile + 1).clearContent();
+  if (idxDocId !== null) sheet.getRange(absoluteRow, idxDocId + 1).clearContent();
+
+  return { action: "TRASHED_DOC", id: docId };
+}
+
+function deleteEssayDocForRowTool(args) {
+  args = args || {};
+  const row = Number(args.row);
+  if (!row || row <= HEADER_ROW) throw new Error("Provide a valid row > header.");
+
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(MAIN_SHEET);
+  if (!sheet) throw new Error(`Missing sheet: ${MAIN_SHEET}`);
+
+  return deleteEssayDocForRow_(sheet, row);
 }
 
 /*************************************************
@@ -1347,6 +2098,70 @@ function syncSurrenderedToSheet() {
     6
   );
 }
+
+/*************************************************
+ * *Email Drafter
+ * ***********************************************/
+
+function getRecommenders_() {
+  const raw = PropertiesService.getScriptProperties().getProperty("RECOMMENDERS_JSON") || "[]";
+  try { return JSON.parse(raw); } catch (e) { return []; }
+}
+
+function listRecommenders_() {
+  const raw = PropertiesService.getScriptProperties().getProperty("RECOMMENDERS_JSON") || "[]";
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function draftRecEmailsForRow_(sheet, absoluteRow) {
+  const headers = sheet.getRange(HEADER_ROW, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const h = buildHeaderIndex(headers);
+
+  const idxName   = mustIndex(h, "Scholarship Name");
+  const idxPortal = optionalIndex_(h, COL_APPLICATION_PORTAL);
+  const idxDue    = optionalIndex_(h, "Due Date");
+
+  const row = sheet.getRange(absoluteRow, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+  const scholarship = String(row[idxName] || "").trim() || "Scholarship";
+  const portal = (idxPortal !== null) ? String(row[idxPortal] || "").trim() : "";
+  const due = (idxDue !== null) ? String(row[idxDue] || "").trim() : "";
+
+  const recs = getRecommenders_();
+  if (!recs.length) return { action: "SKIP_NO_RECOMMENDERS_CONFIGURED" };
+
+  const subject = `Recommendation letter request: ${scholarship}`;
+
+  const draftIds = [];
+  recs.forEach(r => {
+    if (!r || !r.email) return;
+
+    const name = String(r.name || "").trim() || "there";
+    const role = String(r.role || "").trim();
+
+    const body =
+`Dear ${name}${role ? " (" + role + ")" : ""},
+
+I’m applying to ${scholarship} and would like to request a recommendation letter.
+
+Due date: ${due || "N/A"}
+
+If you’re able to support this, I can send any required forms and a short brag sheet immediately.
+
+Thank you so much for your support,
+Kevin Srun`;
+
+    const draft = GmailApp.createDraft(String(r.email).trim(), subject, body);
+    draftIds.push(draft.getId());
+  });
+
+  return { action: "DRAFTED", count: draftIds.length, draftIds };
+}
 /*************************************************
  * AI extraction (URL/PDF) for prompt
  *************************************************/
@@ -1524,6 +2339,165 @@ function geminiExtractEssayPrompt_(sourceText, url) {
     Logger.log("Gemini candidate not valid JSON. Candidate: " + text.slice(0, 2000));
     return { prompt_text: "", word_limit: "", pdf_required: false };
   }
+}
+
+function getAutoshipToolRegistry_() {
+  return [
+    {
+      name: "refreshTriageForMainMenu",
+      description: "Recomputes triage values for the Main Menu sheet.",
+      argsSchema: { type: "object", additionalProperties: false, properties: {} }
+    },
+    {
+      name: "createEssayDocsForSelection",
+      description: "Creates application file docs for selected rows (manual tool).",
+      argsSchema: { type: "object", additionalProperties: false, properties: {} }
+    },
+    {
+      name: "fillEssayPromptsForSelection",
+      description: "Uses AI to fill essay prompts for selected rows (slow).",
+      argsSchema: { type: "object", additionalProperties: false, properties: {} }
+    },
+    {
+      name: "deleteEssayDocForRowTool",
+      description: "Delete the essay Google Doc for a specific Main Menu row.",
+      argsSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          row: { type: "number" }
+        },
+        required: ["row"]
+      }
+    },
+    {
+      name: "syncSatisfiedToResults",
+      description: "Sync Satisfied scholarships to Results sheet.",
+      argsSchema: { type: "object", additionalProperties: false, properties: {} }
+    },
+    {
+      name: "syncSurrenderedToSheet",
+      description: "Sync Surrendered list to Surrendered sheet.",
+      argsSchema: { type: "object", additionalProperties: false, properties: {} }
+    },
+    {
+      name: "draftRecEmailsForRowToRecipientsTool",
+      description: "Create Gmail drafts for selected recommenders for a given Main Menu row.",
+      argsSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          row: { type: "number" },
+          recipients: { type: "array", items: { type: "string" } }
+        },
+        required: ["row", "recipients"]
+      }
+    },
+    {
+      name: "aiSidebarIngest",
+      description: "Ingest scholarship dataset input (URL/paste/upload) and add to Main Menu.",
+      argsSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          url: { type: "string" },
+          pastedText: { type: "string" },
+          extraNotes: { type: "string" },
+          uploadedFile: { type: ["object", "null"] }
+        }
+      }
+    }
+  ];
+}
+
+function geminiExtractEssayPrompts_(sourceText, meta) {
+  meta = meta || {};
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("Missing Script Property: GEMINI_API_KEY");
+
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(GEMINI_MODEL) +
+    ":generateContent?key=" +
+    encodeURIComponent(apiKey);
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      has_essay: { type: "string", enum: ["yes", "no", "unknown"] },
+      prompts: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            prompt: { type: "string" },
+            word_limit: { type: "string" },
+            notes: { type: "string" }
+          },
+          required: ["prompt", "word_limit", "notes"]
+        }
+      },
+      overall_notes: { type: "string" }
+    },
+    required: ["has_essay", "prompts", "overall_notes"]
+  };
+
+  const prompt = [
+    "Extract scholarship essay prompts from the SOURCE TEXT.",
+    "Return ONLY valid JSON (no markdown).",
+    "",
+    "Rules:",
+    "- has_essay = yes if any essay/personal statement/short answer prompt is required or optional.",
+    "- prompts[] should include each distinct prompt found (1+).",
+    "- word_limit: put the number if stated (e.g., '500'), else empty.",
+    "- If prompt is implied but not explicitly stated, set has_essay=unknown and keep prompts empty.",
+    "",
+    "Meta:",
+    JSON.stringify(meta),
+    "",
+    "JSON Schema:",
+    JSON.stringify(schema),
+    "",
+    "SOURCE TEXT:",
+    (sourceText || "").slice(0, 12000)
+  ].join("\n");
+
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: { responseMimeType: "application/json", temperature: 0.1 }
+  };
+
+  const res = UrlFetchApp.fetch(endpoint, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true
+  });
+
+  const code = res.getResponseCode();
+  const raw = res.getContentText() || "";
+  if (code < 200 || code >= 300) throw new Error("Essay prompt extraction failed: HTTP " + code);
+
+  const parsed = JSON.parse(raw);
+  const text = (parsed?.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("").trim();
+  if (!text) throw new Error("Gemini returned empty essay extraction.");
+
+  const obj = JSON.parse(text);
+  obj.prompts = Array.isArray(obj.prompts) ? obj.prompts : [];
+  obj.has_essay = String(obj.has_essay || "unknown").toLowerCase();
+  obj.overall_notes = String(obj.overall_notes || "").trim();
+
+  obj.prompts = obj.prompts
+    .map(p => ({
+      prompt: String(p.prompt || "").trim(),
+      word_limit: String(p.word_limit || "").trim(),
+      notes: String(p.notes || "").trim()
+    }))
+    .filter(p => p.prompt && p.prompt.length >= 10);
+
+  return obj;
 }
 
 function heuristicLimitFallback_(t) {
@@ -2495,6 +3469,160 @@ function canvasDeepFetchTextForModuleItem_(courseId, mi) {
   }
 }
 
+function autoCreateEssayDocForRow_(sheet, absoluteRow, extracted, ctx) {
+  ctx = ctx || {};
+
+  const headers = sheet.getRange(HEADER_ROW, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const h = buildHeaderIndex(headers);
+
+  const idxReq     = optionalIndex_(h, COL_REQUIREMENTS);
+  const idxPortal  = optionalIndex_(h, COL_APPLICATION_PORTAL);
+  const idxAppFile = optionalIndex_(h, COL_APPLICATION_FILE);
+  const idxName    = optionalIndex_(h, "Scholarship Name");
+
+  const idxDocId   = optionalIndex_(h, "Essay Doc ID");
+  const idxStatus  = optionalIndex_(h, "Status");
+  const idxDue     = optionalIndex_(h, "Due Date");
+  const idxTriage  = optionalIndex_(h, "Triage");
+
+  if (idxReq === null || idxAppFile === null || idxName === null) {
+    throw new Error(
+      `Missing required columns on "${MAIN_SHEET}": "Scholarship Name", "${COL_REQUIREMENTS}", "${COL_APPLICATION_FILE}"`
+    );
+  }
+
+  const rowValues = sheet.getRange(absoluteRow, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+  const reqText = String(rowValues[idxReq] ?? "");
+  const name = String(rowValues[idxName] ?? "").trim() || (extracted?.name || "Scholarship");
+
+  // Portal URL (prefer extracted value from intake; fallback to sheet cell text)
+  let portalUrl = String(extracted?.portal_url || ctx.url || "").trim();
+  if (!portalUrl && idxPortal !== null) {
+    portalUrl = String(rowValues[idxPortal] ?? "").trim();
+  }
+
+  // If already has any doc link in Application File, skip
+  const appFileCell = sheet.getRange(absoluteRow, idxAppFile + 1);
+  const existingUrl = extractDocUrlFromCell_(appFileCell);
+  if (existingUrl) return { action: "SKIP_ALREADY_HAS_DOC", url: existingUrl };
+
+  // Decide whether to create doc:
+  // 1) If Requirements includes Essay(s) -> create.
+  // 2) Otherwise, try to detect an essay prompt; if found -> create.
+  let shouldCreate = requirementsIncludes_(reqText, ESSAY_REQUIREMENT_TOKEN);
+
+  // Build best available text for prompt extraction
+  let sourceText = String(ctx.sourceText || "").trim();
+  if (!sourceText || sourceText.length < 40) {
+    // last-resort: fetch from portal (safe: only done when needed)
+    if (portalUrl) {
+      try { sourceText = fetchUrlAsTextSmart_(portalUrl) || ""; } catch (e) {}
+    }
+  }
+
+  // Extract prompt (only if we have text)
+  let promptText = "";
+  let wordLimit = "";
+  let pdfRequired = false;
+
+  if (sourceText && sourceText.length >= 40) {
+    const ep = geminiExtractEssayPrompt_(sourceText.slice(0, 12000), portalUrl);
+    promptText = String(ep?.prompt_text || "").trim();
+    wordLimit = String(ep?.word_limit || "").trim();
+    pdfRequired = !!ep?.pdf_required;
+
+    // If we found a real prompt, create even if Requirements didn't include Essay(s)
+    if (promptText.length >= 20) shouldCreate = true;
+  }
+
+  if (!shouldCreate) return { action: "SKIP_NO_ESSAY_SIGNAL" };
+
+  // Create the doc using your existing creator (now with prompt + limit)
+  const docInfo = createEssayPrepDocOneDraft_({
+    scholarshipName: name,
+    portalUrl,
+    promptText,
+    wordLimit
+  });
+
+  // Store doc id if column exists
+  if (idxDocId !== null && docInfo && docInfo.id) {
+    sheet.getRange(absoluteRow, idxDocId + 1).setValue(docInfo.id);
+  }
+
+  // Put link into Application File
+  appendLinkIntoCell_(sheet, absoluteRow, idxAppFile + 1, "Essay Draft (Google Doc)", docInfo.url);
+
+  // Mark status as Prepped if Status column exists
+  if (idxStatus !== null) {
+    sheet.getRange(absoluteRow, idxStatus + 1).setValue("Prepped");
+  }
+
+  // Update triage if both columns exist
+  if (idxDue !== null && idxTriage !== null) {
+    const due = parseSheetDate_(rowValues[idxDue]);
+    sheet.getRange(absoluteRow, idxTriage + 1).setValue(computeTriage_(due, rowValues[idxTriage]));
+  }
+
+  // Optional: note PDF-required somewhere if you have a column (not shown)
+
+  return { action: "CREATED_DOC", url: docInfo.url, prompt_len: promptText.length, pdf_required: pdfRequired };
+}
+
+function deleteEssayDocForRow_(sheet, row) {
+  const headers = sheet.getRange(HEADER_ROW, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const h = buildHeaderIndex(headers);
+
+  const idxAppFile = optionalIndex_(h, COL_APPLICATION_FILE);
+  const idxDocId = optionalIndex_(h, "Essay Doc ID");
+
+  if (idxAppFile === null && idxDocId === null) {
+    throw new Error(`Need "${COL_APPLICATION_FILE}" or "Essay Doc ID" column to delete.`);
+  }
+
+  // Prefer stored ID
+  let docId = "";
+  if (idxDocId !== null) {
+    docId = String(sheet.getRange(row, idxDocId + 1).getValue() || "").trim();
+  }
+
+  // Fallback: extract from Application File cell
+  if (!docId && idxAppFile !== null) {
+    const cell = sheet.getRange(row, idxAppFile + 1);
+    const docUrl = extractDocUrlFromCell_(cell);
+    docId = extractDriveIdFromUrl_(docUrl);
+  }
+
+  if (!docId) return { action: "SKIP_NO_DOC_FOUND", row };
+
+  const ok = trashDriveFileBestEffort_(docId);
+
+  // Clean up sheet cells
+  if (idxDocId !== null) sheet.getRange(row, idxDocId + 1).clearContent();
+
+  if (idxAppFile !== null) {
+    const cell = sheet.getRange(row, idxAppFile + 1);
+    const txt = String(cell.getDisplayValue() || "");
+    const cleaned = txt
+      .split(/\n+/).map(s => s.trim()).filter(Boolean)
+      .filter(line => !/docs\.google\.com\/document\/d\//i.test(line))
+      .filter(line => normalize_(line) !== normalize_("Essay Draft (Google Doc)"))
+      .join("\n");
+    if (!cleaned) cell.clearContent();
+    else cell.setValue(cleaned);
+  }
+
+  return { action: ok ? "TRASHED_DOC" : "TRASH_FAILED", row, docId };
+}
+
+function draftRecEmailsForRowTool(args) {
+  const row = Number(args.row);
+  if (!row || row <= HEADER_ROW) throw new Error("Provide a valid row > header.");
+  const sh = SpreadsheetApp.getActive().getSheetByName(MAIN_SHEET);
+  return draftRecEmailsForRow_(sh, row);
+}
+
 function installDailyTriageRefreshTrigger() {
   // runs around 6am in your spreadsheet’s timezone
   ScriptApp.newTrigger("refreshTriageForMainMenu")
@@ -2522,6 +3650,13 @@ function safeGetEventById_(cal, eventId) {
   } catch (e) {
     return null;
   }
+}
+
+function isPastDue_(dueDate) {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const d = new Date(dueDate.getFullYear(), dueDate.getMonth(), dueDate.getDate());
+  return d.getTime() < today.getTime();
 }
 
 function applyScholarshipReminders_(ev) {

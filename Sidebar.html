@@ -4,51 +4,247 @@
     <base target="_top" />
     <style>
       body { font-family: Arial, sans-serif; padding: 12px; }
+      .tabs { display: flex; gap: 8px; margin-bottom: 10px; }
+      .tab { padding: 8px 10px; border: 1px solid #ccc; cursor: pointer; }
+      .tab.active { background: #f2f2f2; font-weight: 700; }
+      .panel { display: none; }
+      .panel.active { display: block; }
       textarea, input { width: 100%; box-sizing: border-box; }
       textarea { height: 120px; }
       button { width: 100%; padding: 10px; margin-top: 10px; }
-      .small { font-size: 12px; opacity: 0.8; }
-      .status { margin-top: 10px; }
+      .row { margin-top: 10px; }
+      .status { margin-top: 10px; font-size: 12px; opacity: 0.85; white-space: pre-wrap; }
+      .chatlog { height: 220px; overflow: auto; border: 1px solid #ddd; padding: 8px; margin-top: 8px; }
+      .msg { margin: 6px 0; }
+      .me { font-weight: 700; }
     </style>
   </head>
   <body>
-    <h3>Add Scholarship (AI)</h3>
+    <div class="tabs">
+      <div class="tab active" data-tab="intake">Intake</div>
+      <div class="tab" data-tab="chat">Chat</div>
+    </div>
 
-    <label>Scholarship URL (optional)</label>
-    <input id="url" placeholder="https://..." />
+    <!-- INTAKE -->
+    <div class="panel active" id="intake">
+      <h3>Autoship AI Intake</h3>
 
-    <label style="margin-top:10px; display:block;">Paste scholarship text (recommended)</label>
-    <textarea id="pastedText" placeholder="Paste the scholarship description here..."></textarea>
+      <div class="row">
+        <label>Scholarship / Dataset URL (HTML/PDF/CSV/Sheet) (optional)</label>
+        <input id="url" placeholder="https://..." />
+      </div>
 
-    <label style="margin-top:10px; display:block;">Extra notes (optional)</label>
-    <textarea id="extraNotes" style="height:70px;" placeholder="Anything you want to remember..."></textarea>
+      <div class="row">
+        <label>Paste text (recommended)</label>
+        <textarea id="pastedText" placeholder="Paste scholarship text or dataset text..."></textarea>
+      </div>
 
-    <button onclick="submit()">Extract & Add to Main Menu</button>
+      <div class="row">
+        <label>Upload file (PDF recommended)</label>
+        <input type="file" id="file" accept=".pdf,.txt,.csv" />
+        <div class="status" id="fileStatus"></div>
+      </div>
 
-    <div class="status small" id="status"></div>
+      <div class="row">
+        <label>Extra notes (optional)</label>
+        <textarea id="extraNotes" placeholder="Anything else..."></textarea>
+      </div>
 
+      <button onclick="submitIngest()">Ingest → Fill Main Menu</button>
+      <div class="status" id="ingestStatus"></div>
+    </div>
+
+    <!-- CHAT -->
+    <div class="panel" id="chat">
+      <h3>Autoship AI Chat</h3>
+      <div class="chatlog" id="chatlog"></div>
+      <div class="row">
+        <textarea id="chatInput" placeholder="Ask anything about Autoship..."></textarea>
+      </div>
+      <button onclick="sendChat()">Send</button>
+      <div class="status" id="chatStatus"></div>
+    </div>
 
     <script>
-    function setStatus(msg) {
-      document.getElementById("status").textContent = msg || "";
-    }
+      // tabs
+      document.querySelectorAll(".tab").forEach(t => {
+        t.addEventListener("click", () => {
+          document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
+          document.querySelectorAll(".panel").forEach(x => x.classList.remove("active"));
+          t.classList.add("active");
+          document.getElementById(t.dataset.tab).classList.add("active");
+        });
+      });
 
-    function submit() {
-      setStatus("Working...");
+      function setText(id, s) { document.getElementById(id).textContent = s || ""; }
 
-      const payload = {
-        url: document.getElementById("url").value.trim(),
-        pastedText: document.getElementById("pastedText").value,
-        extraNotes: document.getElementById("extraNotes").value
-      };
+      // Upload file -> server -> returns {driveFileId, driveUrl, name, mimeType}
+      function uploadFileIfAny(cb) {
+        const fileInput = document.getElementById("file");
+        const f = fileInput.files && fileInput.files[0];
+        if (!f) return cb(null);
 
-      google.script.run
-        .withSuccessHandler((res) => {
-          setStatus("Uploaded Row: " + (res && res.addedRow ? res.addedRow : "?"));
-        })
-        .withFailureHandler((err) => {
-          setStatus("Womp Womp " + (err && err.message ? err.message : err));
-        })
-        .aiAddScholarship(payload);
-  }
-</script>
+        setText("fileStatus", "Uploading file to Drive...");
+        const fr = new FileReader();
+        fr.onload = function(e) {
+          const bytes = e.target.result;
+          const payload = {
+            name: f.name,
+            mimeType: f.type || "application/octet-stream",
+            data: Array.from(new Uint8Array(bytes))
+          };
+          google.script.run
+            .withSuccessHandler(res => {
+              setText("fileStatus", res && res.driveUrl ? ("Uploaded: " + res.driveUrl) : "Uploaded.");
+              cb(res);
+            })
+            .withFailureHandler(err => {
+              setText("fileStatus", "Upload failed: " + (err && err.message ? err.message : err));
+              cb(null);
+            })
+            .aiSidebarUploadFile(payload);
+        };
+        fr.readAsArrayBuffer(f);
+      }
+
+      function submitIngest() {
+        setText("ingestStatus", "Working...");
+        uploadFileIfAny((fileRes) => {
+          const payload = {
+            url: document.getElementById("url").value || "",
+            pastedText: document.getElementById("pastedText").value || "",
+            extraNotes: document.getElementById("extraNotes").value || "",
+            uploadedFile: fileRes || null
+          };
+
+          google.script.run
+            .withSuccessHandler(res => {
+              setText("ingestStatus", JSON.stringify(res, null, 2));
+            })
+            .withFailureHandler(err => {
+              setText("ingestStatus", "Error: " + (err && err.message ? err.message : err));
+            })
+            .aiSidebarIngest(payload);
+        });
+      }
+
+      function appendChat(role, text) {
+        const log = document.getElementById("chatlog");
+        const div = document.createElement("div");
+        div.className = "msg";
+        div.innerHTML = `<span class="${role === "me" ? "me" : ""}">${role === "me" ? "You" : "AI"}:</span> ${escapeHtml(text)}`;
+        log.appendChild(div);
+        log.scrollTop = log.scrollHeight;
+      }
+
+      function escapeHtml(s) {
+        return (s || "").replace(/[&<>"']/g, c => ({
+          "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
+        }[c]));
+      }
+
+      function sendChat() {
+        const input = document.getElementById("chatInput");
+        const msg = (input.value || "").trim();
+        if (!msg) return;
+        input.value = "";
+        appendChat("me", msg);
+        setText("chatStatus", "Thinking...");
+
+        google.script.run
+          .withSuccessHandler(res => {
+            setText("chatStatus", "");
+
+            if (!res) {
+              appendChat("ai", "(no response)");
+              return;
+            }
+
+            // Normal reply
+            if (res.type === "reply") {
+              appendChat("ai", res.text || "(no response)");
+              return;
+            }
+
+            // Recommender chooser
+            if (res.type === "choose_recommenders") {
+              appendChat("ai", res.text || "Select which recommender(s) to draft to:");
+
+              const opts = res.options || [];
+              const row = Number(res.row || 0);
+              if (!row) {
+                appendChat("ai", "Missing row number for drafting.");
+                return;
+              }
+
+              const log = document.getElementById("chatlog");
+              const box = document.createElement("div");
+              box.style.border = "1px solid #ddd";
+              box.style.padding = "8px";
+              box.style.marginTop = "8px";
+
+              box.innerHTML = `
+                <div style="font-weight:700; margin-bottom:6px;">Draft to:</div>
+                <div id="recList"></div>
+                <button id="draftBtn" style="width:100%; margin-top:8px; padding:8px;">Create Gmail drafts</button>
+                <div id="draftStatus" style="margin-top:6px; font-size:12px; opacity:0.85;"></div>
+              `;
+
+              log.appendChild(box);
+              log.scrollTop = log.scrollHeight;
+
+              const recList = box.querySelector("#recList");
+              opts.forEach((o) => {
+                const email = (o.email || "").trim();
+                const name = (o.name || "").trim();
+                const role = (o.role || "").trim();
+                if (!email) return;
+
+                const div = document.createElement("div");
+                div.innerHTML = `
+                  <label style="display:block; margin:4px 0;">
+                    <input type="checkbox" data-email="${email.replace(/"/g, "&quot;")}" />
+                    ${name} — ${email}${role ? " (" + role + ")" : ""}
+                  </label>
+                `;
+                recList.appendChild(div);
+              });
+
+              box.querySelector("#draftBtn").onclick = () => {
+                const checks = Array.from(box.querySelectorAll("input[type=checkbox]"));
+                const selected = checks.filter(c => c.checked).map(c => c.getAttribute("data-email")).filter(Boolean);
+
+                if (!selected.length) {
+                  box.querySelector("#draftStatus").textContent = "Select at least one recommender.";
+                  return;
+                }
+
+                box.querySelector("#draftStatus").textContent = "Creating drafts...";
+
+                google.script.run
+                  .withSuccessHandler(r => {
+                    box.querySelector("#draftStatus").textContent =
+                      (r && r.action === "DRAFTED_SELECTED")
+                        ? `Drafted ${r.count} email(s).`
+                        : JSON.stringify(r);
+                  })
+                  .withFailureHandler(err => {
+                    box.querySelector("#draftStatus").textContent =
+                      "Error: " + (err && err.message ? err.message : err);
+                  })
+                  .draftRecEmailsForRowToRecipientsTool({ row: row, recipients: selected });
+              };
+
+              return;
+            }
+
+            appendChat("ai", "(unhandled response type)");
+          })
+          .withFailureHandler(err => {
+            setText("chatStatus", "Error: " + (err && err.message ? err.message : err));
+          })
+          .aiSidebarChat({ message: msg }); // <-- FIX: send an object payload
+        }
+    </script>
+  </body>
+</html>
