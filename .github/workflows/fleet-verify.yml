@@ -1,0 +1,65 @@
+# Managed by Engineering Fleet. Regenerate with: fleet init --ci
+# verification-config-sha256: cd2c6b87f0c1624327ca6efa537887b850f0bd3ebdc0f5943e9ec9bbf0798924
+name: Fleet Verification
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  fleet_lint:
+    name: 'Fleet · JavaScript and sidebar syntax'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 'JavaScript and sidebar syntax'
+        run: |
+          'npm' 'run' 'lint'
+      - name: Record commit binding
+        if: always()
+        run: |
+          echo "Fleet check: lint" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fleet verification commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fleet verification result: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+
+  fleet_test:
+    name: 'Fleet · Deterministic tests'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 'Deterministic tests'
+        run: |
+          'npm' 'test'
+      - name: Record commit binding
+        if: always()
+        run: |
+          echo "Fleet check: test" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fleet verification commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fleet verification result: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+
+  fleet_build:
+    name: 'Fleet · Apps Script manifest validation'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 'Apps Script manifest validation'
+        run: |
+          'npm' 'run' 'build'
+      - name: Record commit binding
+        if: always()
+        run: |
+          echo "Fleet check: build" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fleet verification commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fleet verification result: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"

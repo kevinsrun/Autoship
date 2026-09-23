@@ -1,0 +1,161 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "name": "Autoship",
+    "description": "Google Apps Script scholarship tracking and automation suite",
+    "languages": [
+      "JavaScript",
+      "HTML"
+    ],
+    "metadata": {
+      "runtime": "Google Apps Script V8",
+      "lifecycle": "paused-field-test"
+    }
+  },
+  "repository": {
+    "provider": "github",
+    "remote": "kevinsrun/Autoship"
+  },
+  "instructions": {
+    "repository": "AGENTS.md"
+  },
+  "verification": {
+    "stopOnFailure": true,
+    "timeoutMs": 120000,
+    "maxOutputBytes": 100000,
+    "checks": [
+      {
+        "id": "lint",
+        "label": "JavaScript and sidebar syntax",
+        "command": "npm",
+        "args": ["run", "lint"],
+        "required": true
+      },
+      {
+        "id": "test",
+        "label": "Deterministic tests",
+        "command": "npm",
+        "args": ["test"],
+        "required": true
+      },
+      {
+        "id": "build",
+        "label": "Apps Script manifest validation",
+        "command": "npm",
+        "args": ["run", "build"],
+        "required": true
+      }
+    ]
+  },
+  "tools": [
+    {
+      "id": "github",
+      "adapter": "github-cli",
+      "enabled": true,
+      "mode": "read-write",
+      "capabilities": [
+        "repository-discovery",
+        "issue-task-persistence",
+        "branch-create",
+        "pr-create",
+        "pr-inspect",
+        "ci-inspect",
+        "diff-retrieval"
+      ]
+    }
+  ],
+  "capabilities": {
+    "codex": [
+      "architecture",
+      "implementation",
+      "final-review",
+      "branch-create",
+      "commit",
+      "pr-create",
+      "pr-inspect",
+      "ci-inspect"
+    ],
+    "copilot": [
+      "trace",
+      "test",
+      "audit",
+      "bounded-implementation"
+    ],
+    "gemini": [
+      "independent-review",
+      "large-context-investigation"
+    ],
+    "sentry": [
+      "runtime-error-evidence"
+    ],
+    "datadog": [
+      "telemetry-evidence"
+    ],
+    "blackfire": [
+      "performance-evidence"
+    ],
+    "camber": [
+      "compute-job"
+    ]
+  },
+  "deployment": {
+    "environments": [],
+    "productionPolicy": "approval-required",
+    "metadata": {}
+  },
+  "risk": {
+    "paths": [
+      {
+        "pattern": ".github/workflows/**",
+        "level": "high",
+        "reason": "CI and release control plane"
+      },
+      {
+        "pattern": ".clasp.json",
+        "level": "high",
+        "reason": "Binding to the live Google Apps Script project"
+      },
+      {
+        "pattern": "appsscript.json",
+        "level": "high",
+        "reason": "Runtime permissions and advanced-service boundary"
+      },
+      {
+        "pattern": "Code.js",
+        "level": "high",
+        "reason": "Monolithic production code with Sheets, Drive, Calendar, Canvas, and Gemini effects"
+      },
+      {
+        "pattern": "Sidebar.html",
+        "level": "medium",
+        "reason": "User input and Apps Script RPC boundary"
+      }
+    ],
+    "operations": {
+      "production-deploy": "approval-required",
+      "destructive-migration": "approval-required",
+      "secret-mutation": "approval-required",
+      "branch-delete": "approval-required",
+      "force-push": "approval-required",
+      "production-data-mutation": "approval-required",
+      "credential-change": "approval-required"
+    }
+  },
+  "context": {
+    "include": [
+      "README.md",
+      "AGENTS.md",
+      "package.json",
+      "appsscript.json",
+      "docs/fleet-field-test/baseline.md"
+    ],
+    "exclude": [
+      "node_modules/**",
+      "dist/**",
+      "coverage/**",
+      ".git/**",
+      ".fleet/state/**"
+    ],
+    "maxBytes": 100000
+  }
+}
