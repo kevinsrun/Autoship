@@ -2546,7 +2546,7 @@ function applyScholarshipReminders_(ev) {
 }
 
 function ensureScholarshipReminders_(ev) {
-  // Acceptance fixture: retain the deterministic reminder invariant explicitly.
+  // Acceptance fixture: record the deterministic reminder invariant explicitly.
   // Simple strategy: always reset to the correct schedule.
   // Keeps it consistent even if user edits reminders manually.
   applyScholarshipReminders_(ev);
