@@ -69,6 +69,7 @@
       "architecture",
       "implementation",
       "final-review",
+      "task-write",
       "branch-create",
       "commit",
       "pr-create",
