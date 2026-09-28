@@ -39,3 +39,12 @@ Google/Canvas/Gemini services, mutate production data, or expose identifiers
 and credentials. `.clasp.json`, `appsscript.json`, CI configuration, and the
 monolithic production script are risk-sensitive. All product work will use
 dedicated branches and PRs; `main` remains unchanged.
+
+## Fleet acceptance evidence
+
+The repeated A/B commits on `fleet/field-test-bootstrap` exercise only Fleet's
+exact-SHA verification and review-staleness behavior. This repository has no
+configured Phase 4 provider route, so those commits are not evidence for
+provider resolution, dispatch, context hashing, or artifact provenance. Those
+paths are covered by Engineering Fleet's separate deterministic architecture
+acceptance fixture.
