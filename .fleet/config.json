@@ -69,6 +69,7 @@
       "architecture",
       "implementation",
       "final-review",
+      "policy-override",
       "task-write",
       "branch-create",
       "commit",
