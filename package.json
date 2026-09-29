@@ -1,0 +1,14 @@
+{
+  "name": "autoship-apps-script",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Local validation harness for the Autoship Google Apps Script project",
+  "scripts": {
+    "lint": "node --check Code.js && node scripts/check-sidebar.mjs",
+    "test": "node --test",
+    "build": "node scripts/check-manifest.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
